@@ -8,22 +8,30 @@ import mujoco
 import numpy as np
 
 from so101_bowling.assets import SceneEntityIds, compute_hollow_pin_inertia
-from so101_bowling.config import WorkspaceConfig
+from so101_bowling.config import DRConfig, WorkspaceConfig
 
 
 def _quat_mul(q1: np.ndarray, q2: np.ndarray) -> np.ndarray:
-    """Multiply two wxyz quaternions."""
-    w1, x1, y1, z1 = q1
-    w2, x2, y2, z2 = q2
-    return np.array(
-        [
-            w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
-            w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
-            w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
-            w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
-        ],
-        dtype=np.float64,
-    )
+    """Multiply two wxyz quaternions using MuJoCo's built-in utility."""
+    out = np.empty(4, dtype=np.float64)
+    mujoco.mju_mulQuat(out, np.asarray(q1, dtype=np.float64), np.asarray(q2, dtype=np.float64))
+    return out
+
+
+def _lookat_quat(pos: np.ndarray, target: np.ndarray) -> np.ndarray:
+    """Build MuJoCo camera wxyz quaternion looking from pos toward target (+Z up)."""
+    fwd = np.asarray(target, dtype=np.float64) - np.asarray(pos, dtype=np.float64)
+    fwd /= np.linalg.norm(fwd)
+    up_hint = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+    if abs(float(np.dot(fwd, up_hint))) > 0.99:
+        up_hint = np.array([1.0, 0.0, 0.0], dtype=np.float64)
+    right = np.cross(fwd, up_hint)
+    right /= np.linalg.norm(right)
+    up = np.cross(right, fwd)
+    rot = np.column_stack((right, up, -fwd)).reshape(9)
+    quat = np.empty(4, dtype=np.float64)
+    mujoco.mju_mat2Quat(quat, rot)
+    return quat
 
 
 def _small_angle_quat(euler_rad: np.ndarray) -> np.ndarray:
@@ -184,13 +192,18 @@ class DomainRandomizer:
             m.actuator_gainprm[act, 0] *= kp_scale
             m.actuator_biasprm[act, 1] *= kp_scale
 
-        # 5. Bounded camera pose & FOV jitter (keeps ball & pins in frame).
+        # 5. Bounded camera pose, look-at target, & FOV jitter (keeps ball & pins in frame).
         tid = self.ids.tripod_cam_id
-        m.cam_pos[tid] += rng.uniform(
+        tripod_pos = self._nom_cam_pos[tid] + rng.uniform(
             -dr.tripod_pos_jitter, dr.tripod_pos_jitter, size=3
         )
+        tripod_target = np.asarray(self.cfg.camera.tripod_target, dtype=np.float64) + rng.uniform(
+            -dr.tripod_target_jitter, dr.tripod_target_jitter, size=3
+        )
+        m.cam_pos[tid] = tripod_pos
         m.cam_quat[tid] = _quat_mul(
-            m.cam_quat[tid], _small_angle_quat(rng.uniform(-0.025, 0.025, size=3))
+            _lookat_quat(tripod_pos, tripod_target),
+            _small_angle_quat(np.array([0.0, 0.0, float(rng.uniform(-0.025, 0.025))])),
         )
         m.cam_fovy[tid] += float(rng.uniform(-dr.tripod_fovy_jitter, dr.tripod_fovy_jitter))
 
@@ -279,6 +292,7 @@ def augment_rgb(
     rng: np.random.Generator,
     dr_enabled: bool,
     shift_xy: tuple[int, int] | None = None,
+    dr_cfg: DRConfig | None = None,
 ) -> np.ndarray:
     """Apply photometric and small spatial shift augmentations preserving uint8 (H, W, 3)."""
     if img.dtype != np.uint8 or img.ndim != 3 or img.shape[2] != 3:
@@ -286,11 +300,15 @@ def augment_rgb(
     if not dr_enabled:
         return img.copy()
 
+    dr = dr_cfg if dr_cfg is not None else DRConfig()
     h, w, _ = img.shape
-    max_shift = 3
+    max_shift = int(dr.max_shift_px)
     if shift_xy is None:
-        sx = int(rng.integers(-max_shift, max_shift + 1))
-        sy = int(rng.integers(-max_shift, max_shift + 1))
+        if max_shift > 0:
+            sx = int(rng.integers(-max_shift, max_shift + 1))
+            sy = int(rng.integers(-max_shift, max_shift + 1))
+        else:
+            sx = sy = 0
     else:
         sx, sy = int(shift_xy[0]), int(shift_xy[1])
 
@@ -308,21 +326,23 @@ def augment_rgb(
     arr = out.astype(np.float32) / 255.0
 
     # Contrast & brightness
-    contrast = float(rng.uniform(0.85, 1.15))
-    brightness = float(rng.uniform(-0.10, 0.10))
+    contrast = float(rng.uniform(*dr.contrast_scale))
+    brightness = float(rng.uniform(-dr.brightness_delta, dr.brightness_delta))
     arr = (arr - 0.5) * contrast + 0.5 + brightness
 
     # Gamma
-    gamma = float(rng.uniform(0.88, 1.12))
+    gamma = float(rng.uniform(*dr.gamma_range))
     arr = np.power(np.clip(arr, 0.0, 1.0), gamma)
 
     # Saturation
-    sat = float(rng.uniform(0.85, 1.15))
+    sat = float(rng.uniform(*dr.saturation_scale))
     gray = 0.299 * arr[:, :, 0:1] + 0.587 * arr[:, :, 1:2] + 0.114 * arr[:, :, 2:3]
     arr = gray + sat * (arr - gray)
 
     # Pixel noise
-    noise = rng.normal(0.0, 4.0 / 255.0, size=arr.shape).astype(np.float32)
-    arr = np.clip(arr + noise, 0.0, 1.0)
+    if dr.noise_std > 0.0:
+        noise = rng.normal(0.0, float(dr.noise_std) / 255.0, size=arr.shape).astype(np.float32)
+        arr = arr + noise
+    arr = np.clip(arr, 0.0, 1.0)
 
     return np.rint(arr * 255.0).astype(np.uint8)

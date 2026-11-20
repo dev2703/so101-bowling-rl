@@ -110,7 +110,6 @@ class DeliveryScorer:
         self._separation_x = 0.0
         self._sep_steps = 0
         self._quiet_steps = 0
-        self._reached_rack = False
         self._left_reach = False
         self._latest_t: float | None = None
         self._latest_ball_x = float(self.ball_init_pos[0])
@@ -203,12 +202,14 @@ class DeliveryScorer:
             self._invalidate("double_tap_restrike")
 
         if self.phase == DeliveryPhase.RELEASED:
-            self._reached_rack |= ball_x >= cfg.rack_x_nom - 0.08
             # A separated ball is beyond legal forward reach once its rear
             # surface has cleared the arm's foul boundary.
             self._left_reach |= ball_x - cfg.ball_radius > cfg.foul_line_x
-            ball_quiet = np.linalg.norm(snap.ball_vel[:2]) < cfg.quiet_vel_mps
-            if (self._reached_rack or ball_quiet) and ball_quiet and np.max(snap.pin_speeds) < cfg.quiet_vel_mps:
+            ball_off = float(snap.ball_pos[2]) < cfg.off_table_z_m
+            ball_done = ball_off or float(np.linalg.norm(snap.ball_vel[:2])) < cfg.quiet_vel_mps
+            pins_off = snap.pin_positions[:, 2] < cfg.off_table_z_m
+            pins_done = bool(np.all(pins_off | (snap.pin_speeds < cfg.quiet_vel_mps)))
+            if ball_done and pins_done:
                 self._quiet_steps += 1
             else:
                 self._quiet_steps = 0

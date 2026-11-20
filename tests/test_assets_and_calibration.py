@@ -160,6 +160,8 @@ def test_scene_xml_compiles_and_entity_ids() -> None:
 def test_pins_rest_upright_stability() -> None:
     cfg = load_config()
     model = mujoco.MjModel.from_xml_string(build_scene_xml(cfg))
+    # Only the 6 ball-pad / ball-desk condim=6 pairs should exist (no O(N^2) pair bloat).
+    assert model.npair == 6
     data = mujoco.MjData(model)
     ids = get_scene_entity_ids(model)
 
@@ -185,6 +187,8 @@ def test_pins_rest_upright_stability() -> None:
 def test_condim6_rolling_friction_and_pad_desk_seam() -> None:
     cfg = load_config()
     model = mujoco.MjModel.from_xml_string(build_scene_xml(cfg))
+    # Only the 6 ball-pad / ball-desk condim=6 pairs should exist (no O(N^2) pair bloat).
+    assert model.npair == 6
     data = mujoco.MjData(model)
     ids = get_scene_entity_ids(model)
 
@@ -225,6 +229,8 @@ def test_condim6_rolling_friction_and_pad_desk_seam() -> None:
 def test_domain_randomizer_and_rgb_augmentation() -> None:
     cfg = load_config()
     model = mujoco.MjModel.from_xml_string(build_scene_xml(cfg))
+    # Only the 6 ball-pad / ball-desk condim=6 pairs should exist (no O(N^2) pair bloat).
+    assert model.npair == 6
     data = mujoco.MjData(model)
     ids = get_scene_entity_ids(model)
 
@@ -252,21 +258,46 @@ def test_domain_randomizer_and_rgb_augmentation() -> None:
     np.testing.assert_allclose(model.pair_friction, nom_pair_fric)
     np.testing.assert_allclose(model.cam_pos, nom_cam_pos)
 
-    # RGB augmentation preserves shape & dtype and leaves image unchanged when disabled.
+    # RGB augmentation preserves shape & dtype and respects DRConfig bounds.
     img = np.full((64, 112, 3), 120, dtype=np.uint8)
     img[:, :56, 0] = 200
     unchanged = augment_rgb(img, rng, dr_enabled=False)
     assert unchanged.dtype == np.uint8 and unchanged.shape == (64, 112, 3)
     np.testing.assert_array_equal(unchanged, img)
 
-    aug = augment_rgb(img, rng, dr_enabled=True, shift_xy=(2, -1))
+    from dataclasses import replace as dc_replace
+
+    zero_dr = dc_replace(
+        cfg.dr,
+        max_shift_px=0,
+        brightness_delta=0.0,
+        contrast_scale=(1.0, 1.0),
+        gamma_range=(1.0, 1.0),
+        saturation_scale=(1.0, 1.0),
+        noise_std=0.0,
+    )
+    identity = augment_rgb(img, rng, dr_enabled=True, dr_cfg=zero_dr)
+    np.testing.assert_array_equal(identity, img)
+
+    aug = augment_rgb(img, rng, dr_enabled=True, shift_xy=(2, -1), dr_cfg=cfg.dr)
     assert aug.dtype == np.uint8 and aug.shape == (64, 112, 3)
     assert not np.array_equal(aug, img)
+
+    # tripod_target_jitter rotates tripod_cam even when tripod_pos_jitter == 0.
+    nom_quat = model.cam_quat[ids.tripod_cam_id].copy()
+    tgt_only_cfg = dc_replace(
+        cfg, dr=dc_replace(cfg.dr, tripod_pos_jitter=0.0, tripod_target_jitter=0.05)
+    )
+    dr_tgt = DomainRandomizer(model, ids, tgt_only_cfg)
+    dr_tgt.apply_episode(data, np.random.default_rng(7), dr_enabled=True)
+    assert not np.allclose(model.cam_quat[ids.tripod_cam_id], nom_quat)
 
 
 def test_render_wrist_and_tripod_cameras() -> None:
     cfg = load_config()
     model = mujoco.MjModel.from_xml_string(build_scene_xml(cfg))
+    # Only the 6 ball-pad / ball-desk condim=6 pairs should exist (no O(N^2) pair bloat).
+    assert model.npair == 6
     data = mujoco.MjData(model)
 
     for jname, qpos_val in cfg.robot.home_qpos.items():
@@ -294,3 +325,57 @@ def test_render_wrist_and_tripod_cameras() -> None:
         assert img.std() > 10.0
 
     assert not np.allclose(wrist_img, tripod_img)
+
+    # Verify wrist_cam is right-side-up (+Z world aligned with image +Y) and right=-Y world.
+    wid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_CAMERA, "wrist_cam")
+    cam_xmat = data.cam_xmat[wid].reshape(3, 3)
+    assert cam_xmat[2, 1] > 0.5, f"wrist_cam appears inverted: cam_up_z={cam_xmat[2, 1]:.3f}"
+    assert cam_xmat[1, 0] < -0.5, f"wrist_cam horizontal axis flipped: cam_right_y={cam_xmat[1, 0]:.3f}"
+
+
+def test_collision_geoms_transparent_and_config_scorer_fields() -> None:
+    cfg = load_config()
+    assert cfg.delivery.foul_line_x == 0.44
+    assert cfg.delivery.release_line_x == 0.44
+    assert cfg.delivery.min_push_disp_m == 0.025
+    assert cfg.delivery.wobble_tilt_deg == 12.0
+    assert cfg.delivery.full_fall_tilt_deg == 45.0
+    assert cfg.reward.r_pin_credit == 5.0
+    assert cfg.reward.r_strike_bonus == 5.0
+    assert cfg.reward.r_illegal_penalty == -2.0
+    assert cfg.reward.gamma == 0.99
+
+    model = mujoco.MjModel.from_xml_string(build_scene_xml(cfg))
+    # Only the 6 ball-pad / ball-desk condim=6 pairs should exist (no O(N^2) pair bloat).
+    assert model.npair == 6
+    data = mujoco.MjData(model)
+    ids = get_scene_entity_ids(model)
+    for jname, qpos_val in cfg.robot.home_qpos.items():
+        jid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, jname)
+        data.qpos[model.jnt_qposadr[jid]] = qpos_val
+    mujoco.mj_forward(model, data)
+
+    # All group-3 collision geoms on pins and arm must be fully transparent (alpha == 0).
+    for gset in ids.pin_geom_ids:
+        for gid in gset:
+            if model.geom_group[gid] == 3:
+                assert model.geom_rgba[gid, 3] == pytest.approx(0.0)
+    for gid in ids.arm_geom_ids:
+        if model.geom_group[gid] == 3:
+            assert model.geom_rgba[gid, 3] == pytest.approx(0.0)
+
+    renderer = mujoco.Renderer(model, height=128, width=224)
+    try:
+        opt0 = mujoco.MjvOption()
+        opt0.geomgroup[3] = 0
+        renderer.update_scene(data, camera="tripod_cam", scene_option=opt0)
+        img_g0 = renderer.render().copy()
+
+        opt1 = mujoco.MjvOption()
+        opt1.geomgroup[3] = 1
+        renderer.update_scene(data, camera="tripod_cam", scene_option=opt1)
+        img_g1 = renderer.render().copy()
+    finally:
+        renderer.close()
+
+    np.testing.assert_array_equal(img_g0, img_g1)

@@ -28,6 +28,7 @@ pin:
   belly_radius: 0.03435
   neck_radius: 0.01615
   base_radius: 0.0255
+  foot_radius: 0.015
   mass: 0.032
   positions:
     - [0.62, 0.0]
@@ -57,9 +58,9 @@ table:
 camera:
   render_height: 64
   render_width: 112
-  wrist_pos: [0.042, 0.0, -0.025]
-  wrist_xyaxes: [0.0, 1.0, 0.0, -0.996, 0.0, -0.087]
-  wrist_fovy: 70.0
+  wrist_pos: [0.045, 0.0, -0.028]
+  wrist_xyaxes: [0.0, -1.0, 0.0, 0.990, 0.0, -0.140]
+  wrist_fovy: 72.0
   tripod_pos: [0.36, -0.58, 0.44]
   tripod_target: [0.38, 0.0, 0.06]
   tripod_fovy: 48.0
@@ -69,16 +70,32 @@ camera:
 
 delivery:
   max_steps: 80
-  settle_steps: 40
-  ball_rest_vel_thresh: 0.02
-  pin_knock_tilt_deg: 35.0
-  pin_fall_z_thresh: -0.05
+  staging_clearance_m: 0.055
+  foul_line_x: 0.44
+  release_line_x: 0.44
+  min_push_disp_m: 0.025
+  min_launch_speed_mps: 0.25
+  target_launch_speed_mps: 0.95
+  aim_sigma_rad: 0.14
+  sep_dist_m: 0.015
+  sep_duration_s: 0.025
+  wobble_tilt_deg: 12.0
+  full_fall_tilt_deg: 45.0
+  wobble_duration_s: 0.02
+  off_table_z_m: -0.05
+  quiet_vel_mps: 0.02
+  quiet_dwell_s: 0.25
+  max_coast_s: 2.5
 
 reward:
-  pin_knock_reward: 1.0
-  strike_bonus: 1.0
-  ball_progress_weight: 0.25
-  action_smoothness_weight: 0.01
+  gamma: 0.99
+  w_stage_phi: 0.40
+  w_contact_speed: 0.60
+  w_launch_angle: 0.60
+  w_action_jerk: 0.005
+  r_pin_credit: 5.0
+  r_strike_bonus: 5.0
+  r_illegal_penalty: -2.0
 
 dr:
   enabled: false

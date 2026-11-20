@@ -288,3 +288,26 @@ def test_timeout_during_push_without_release_is_unpenalized():
     assert not outcome.legal_delivery
     assert outcome.invalid_reason == "no_legal_release"
     assert outcome.total_terminal_reward == 0
+
+
+def test_off_table_falling_ball_and_pin_settle_cleanly_without_timeout():
+    delivery = Delivery()
+    delivery.launch()
+    delivery.step(
+        ball_pos=np.array([0.62, 0.0, 0.05]),
+        ball_pin_contacts=(True, False, False),
+    )
+    # Ball and impacted pin 0 fall off the back desk edge while still carrying horizontal speed.
+    pin_pos = np.array([[0.85, 0.0, -0.12], [0.695, -0.044, 0.0], [0.695, 0.044, 0.0]])
+    pin_speeds = np.array([1.2, 0.0, 0.0])
+    for _ in range(50):
+        delivery.step(
+            ball_pos=np.array([0.90, 0.0, -0.15]),
+            ball_vel=np.array([0.5, 0.0, -1.5]),
+            pin_positions=pin_pos,
+            pin_speeds=pin_speeds,
+        )
+    assert delivery.scorer.is_coast_settled(0.5) == (True, False)
+    outcome = delivery.outcome(False)
+    assert outcome.legal_delivery and not outcome.unresolved_motion
+    assert outcome.off_table_pins == 1 and outcome.credited_pins == 1

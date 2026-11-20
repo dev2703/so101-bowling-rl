@@ -142,17 +142,28 @@ def _build_lathe_obj(
                 jn = (j + 1) % n_rad
                 lines.append(f"f {i0 + j} {i0 + jn} {top_center_idx}")
 
-    if bottom_center_idx is not None and ring_start_idx[0] > 0:
-        i0 = ring_start_idx[0]
+    if bottom_center_idx is not None and radii[0] > 1e-8:
+        # Duplicate bottom edge ring so flat cap normals do not bleed onto side walls.
+        cap_ring_start = v_count + 1
+        for j in range(n_rad):
+            x = radii[0] * cos_a[j]
+            y = radii[0] * sin_a[j]
+            lines.append(f"v {x:.6f} {y:.6f} {z_levels[0]:.6f}")
+            v_count += 1
         for j in range(n_rad):
             jn = (j + 1) % n_rad
-            lines.append(f"f {bottom_center_idx} {i0 + jn} {i0 + j}")
+            lines.append(f"f {bottom_center_idx} {cap_ring_start + jn} {cap_ring_start + j}")
 
     if top_center_idx is not None and ring_start_idx[-1] > 0:
-        il = ring_start_idx[-1]
+        cap_top_start = v_count + 1
+        for j in range(n_rad):
+            x = radii[-1] * cos_a[j]
+            y = radii[-1] * sin_a[j]
+            lines.append(f"v {x:.6f} {y:.6f} {z_levels[-1]:.6f}")
+            v_count += 1
         for j in range(n_rad):
             jn = (j + 1) % n_rad
-            lines.append(f"f {il + j} {il + jn} {top_center_idx}")
+            lines.append(f"f {cap_top_start + j} {cap_top_start + jn} {top_center_idx}")
 
     return "\n".join(lines) + "\n"
 
@@ -316,6 +327,15 @@ def build_scene_xml(
         glob = ET.SubElement(visual, "global")
     glob.set("offwidth", "640")
     glob.set("offheight", "480")
+    vmap = visual.find("map")
+    if vmap is None:
+        vmap = ET.SubElement(visual, "map")
+    vmap.set("znear", "0.002")
+
+    # Make all SO-101 arm collision geoms fully transparent so only visual meshes render.
+    for geom in mj.findall(".//geom[@class='collision']"):
+        geom.attrib.pop("material", None)
+        geom.set("rgba", "0 0 0 0")
 
     # Recolor upstream yellow plastic to white/off-white and servos to matte charcoal.
     plastic_str = _fmt(cfg.robot.plastic_rgba)
@@ -461,6 +481,8 @@ def build_scene_xml(
             size=f"{0.5*(x1-x0):.6g} {0.5*(y1-y0):.6g} {0.5*dt:.6g}",
             material="desk_mat",
             friction=pin_fric,
+            priority="1",
+            solref="0.02 1",
             contype="1",
             conaffinity="1",
         )
@@ -477,6 +499,8 @@ def build_scene_xml(
         size=f"{0.5*(px1-px0):.6g} {0.5*(py1-py0):.6g} {pad_hz:.6g}",
         material="pad_mat",
         friction=pin_fric,
+        priority="1",
+        solref="0.02 1",
         contype="1",
         conaffinity="1",
     )
@@ -499,6 +523,8 @@ def build_scene_xml(
         euler=f"0 {theta:.6g} 0",
         size=f"{ramp_hx:.6g} {0.5*(py1-py0):.6g} {ramp_hz:.6g}",
         material="pad_mat",
+        priority="1",
+        solref="0.02 1",
         contype="1",
         conaffinity="1",
     )
@@ -531,6 +557,8 @@ def build_scene_xml(
         material="ball_mat",
         contype="1",
         conaffinity="1",
+        solref="0.014 0.15",
+        friction="0.12 0.005 0.0001",
     )
 
     # 3 Hollow unweighted cream-white plastic bowling pins with compound collision primitives.
@@ -578,18 +606,25 @@ def build_scene_xml(
             conaffinity="0",
             group="2",
         )
-        # Compound primitive collision profile: flat base cylinder + belly + taper + neck + head.
+        # Compound primitive collision profile: recessed foot cylinder + belly + taper + neck + head.
+        # Kept transparent (rgba="0 0 0 0", group="3") so only cream/red visual meshes render.
+        foot_r = float(cfg.pin.foot_radius)
+        pin_col_attrs = {
+            "rgba": "0 0 0 0",
+            "group": "3",
+            "contype": "1",
+            "conaffinity": "1",
+            "solref": "0.014 0.15",
+            "friction": "0.12 0.005 0.0001",
+        }
         ET.SubElement(
             pin_body,
             "geom",
             name=f"pin_{idx}_col_base",
             type="cylinder",
             pos="0 0 0.008",
-            size=f"{base_r:.6g} 0.008",
-            group="3",
-            contype="1",
-            conaffinity="1",
-            friction=pin_fric,
+            size=f"{foot_r:.6g} 0.008",
+            **pin_col_attrs,
         )
         ET.SubElement(
             pin_body,
@@ -598,10 +633,7 @@ def build_scene_xml(
             type="cylinder",
             pos="0 0 0.044",
             size=f"{belly_r:.6g} 0.024",
-            group="3",
-            contype="1",
-            conaffinity="1",
-            friction=pin_fric,
+            **pin_col_attrs,
         )
         ET.SubElement(
             pin_body,
@@ -610,10 +642,7 @@ def build_scene_xml(
             type="cylinder",
             pos="0 0 0.0815",
             size=f"{0.5 * (belly_r + neck_r):.6g} 0.0135",
-            group="3",
-            contype="1",
-            conaffinity="1",
-            friction=pin_fric,
+            **pin_col_attrs,
         )
         ET.SubElement(
             pin_body,
@@ -622,10 +651,7 @@ def build_scene_xml(
             type="cylinder",
             pos="0 0 0.1125",
             size=f"{neck_r:.6g} 0.0175",
-            group="3",
-            contype="1",
-            conaffinity="1",
-            friction=pin_fric,
+            **pin_col_attrs,
         )
         head_r = min(1.42 * neck_r, 0.72 * belly_r)
         ET.SubElement(
@@ -635,10 +661,7 @@ def build_scene_xml(
             type="capsule",
             fromto=f"0 0 0.145 0 0 {h - head_r:.6g}",
             size=f"{head_r:.6g}",
-            group="3",
-            contype="1",
-            conaffinity="1",
-            friction=pin_fric,
+            **pin_col_attrs,
         )
 
     # Lightweight visual-only distractors (hidden at z=-5 in nominal mode).

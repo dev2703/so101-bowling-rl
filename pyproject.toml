@@ -33,3 +33,6 @@ packages = ["src/so101_bowling"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
+markers = [
+    "hardware: tests requiring physical SO-101 arm or live cameras",
+]

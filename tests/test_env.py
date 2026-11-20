@@ -127,3 +127,79 @@ def test_physics_only_and_custom_timestep():
         np.testing.assert_array_equal(obs["camera_meta"], [10, 0, 10, 0])
         assert env._renderer is None
     assert env._renderer is None
+
+
+def test_config_fields_propagate_to_scorer_and_dr_default():
+    cfg = load_config()
+    custom = replace(
+        cfg,
+        delivery=replace(cfg.delivery, foul_line_x=0.41, min_push_disp_m=0.031, wobble_tilt_deg=15.0),
+        reward=replace(cfg.reward, r_pin_credit=6.5, r_strike_bonus=4.0, r_illegal_penalty=-3.0, gamma=0.97),
+        dr=replace(cfg.dr, enabled=True),
+    )
+    with SO101BowlingEnv(cfg=custom, render_rgb=False, seed=5) as env:
+        assert env.dr_enabled is True
+        sc = env.scorer.config
+        assert sc.foul_line_x == 0.41
+        assert sc.min_push_disp_m == 0.031
+        assert sc.wobble_tilt_deg == 15.0
+        assert sc.r_pin_credit == 6.5
+        assert sc.r_strike_bonus == 4.0
+        assert sc.r_illegal_penalty == -3.0
+        assert sc.gamma == 0.97
+
+
+def test_stationary_scene_stays_fresh_and_per_camera_shifts_independent():
+    with SO101BowlingEnv(dr_enabled=False, render_rgb=True) as env:
+        obs0, _ = env.reset(seed=11)
+        np.testing.assert_allclose(obs0["camera_meta"], [0.0, 1.0, 0.0, 1.0])
+        for _ in range(3):
+            obs, _, done, _, _ = env.step(ZERO)
+            assert not done
+            # Live stationary renders advance capture time and stay fresh (not rejected by pixel equality).
+            assert obs["camera_meta"][0] == pytest.approx(0.0, abs=1e-6)
+            assert obs["camera_meta"][1] == 1.0
+            assert obs["camera_meta"][2] == pytest.approx(0.0, abs=1e-6)
+            assert obs["camera_meta"][3] == 1.0
+
+    with SO101BowlingEnv(dr_enabled=True, render_rgb=False) as env:
+        saw_distinct = False
+        for seed in range(10):
+            env.reset(seed=seed)
+            assert len(env._shifts) == 2
+            if env._shifts[0] != env._shifts[1]:
+                saw_distinct = True
+                break
+        assert saw_distinct
+
+
+def test_env_detects_deliberate_foul_and_table_slam():
+    # Deliberate foul-line crossing via tightening foul_line_x right in front of home reach.
+    cfg = load_config()
+    foul_cfg = replace(cfg, delivery=replace(cfg.delivery, foul_line_x=0.25))
+    with SO101BowlingEnv(cfg=foul_cfg, render_rgb=False) as env:
+        env.reset(seed=2)
+        done = False
+        info = {}
+        for _ in range(25):
+            # Extend shoulder_lift & elbow forward along +X past foul_line_x=0.25.
+            _, _, done, _, info = env.step(np.array([0.0, 1.0, -0.5, 0.0], dtype=np.float32))
+            if done:
+                break
+        assert done
+        assert info["outcome"]["legal_delivery"] is False
+        assert info["outcome"]["invalid_reason"] == "foul_line_crossing"
+        assert info["outcome"]["penalty_reward"] == cfg.reward.r_illegal_penalty
+
+    # Deliberate downward table slam into mousepad/desk.
+    with SO101BowlingEnv(cfg=cfg, render_rgb=False) as env:
+        env.reset(seed=2)
+        done = False
+        info = {}
+        for _ in range(40):
+            _, _, done, _, info = env.step(np.array([0.0, 1.0, 0.5, 1.0], dtype=np.float32))
+            if done:
+                break
+        assert done
+        assert info["outcome"]["legal_delivery"] is False
+        assert info["outcome"]["invalid_reason"] in ("table_slam", "foul_line_crossing", "non_pusher_ball_contact")
