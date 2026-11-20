@@ -1,0 +1,109 @@
+# SO-101 3-Pin Tabletop Bowling Workspace Configuration
+
+robot:
+  mjcf_path: assets/so101/so101_new_calib_camera.xml
+  base_pos: [0.0, 0.0, 0.0]
+  home_qpos:
+    shoulder_pan: 0.0
+    shoulder_lift: -1.55
+    elbow_flex: 1.05
+    wrist_flex: 1.05
+    wrist_roll: 0.0
+    gripper: -0.17453297762778586
+  plastic_rgba: [0.93, 0.92, 0.89, 1.0]
+  servo_rgba: [0.10, 0.10, 0.10, 1.0]
+  control_hz: 20.0
+  physics_dt: 0.002
+  max_action_rad: 0.08
+
+ball:
+  radius: 0.0485
+  mass: 0.065
+  spawn_pos: [0.28, 0.0]
+  rgba: [0.08, 0.34, 0.86, 1.0]
+
+pin:
+  count: 3
+  height: 0.1778
+  belly_radius: 0.03435
+  neck_radius: 0.01615
+  base_radius: 0.0255
+  mass: 0.032
+  positions:
+    - [0.62, 0.0]
+    - [0.695, -0.044]
+    - [0.695, 0.044]
+  body_rgba: [0.96, 0.94, 0.88, 1.0]
+  stripe_rgba: [0.82, 0.12, 0.12, 1.0]
+  mesh_dir: assets/bowling
+  num_radial_segments: 32
+  num_height_segments: 48
+
+table:
+  desk_x_range: [-0.15, 0.80]
+  desk_y_range: [-0.35, 0.35]
+  desk_thickness: 0.03
+  desk_rgba: [0.80, 0.73, 0.62, 1.0]
+  pad_x_range: [0.08, 0.42]
+  pad_y_range: [-0.18, 0.18]
+  pad_thickness: 0.0035
+  pad_rgba: [0.16, 0.17, 0.19, 1.0]
+  pad_ramp_length: 0.015
+  # MuJoCo condim="6" friction: [slide1, slide2, torsional, roll1, roll2]
+  pad_friction: [0.50, 0.50, 0.005, 0.0025, 0.0025]
+  desk_friction: [0.28, 0.28, 0.003, 0.0008, 0.0008]
+  pin_desk_friction: [0.45, 0.005, 0.0001]
+
+camera:
+  render_height: 64
+  render_width: 112
+  wrist_pos: [0.042, 0.0, -0.025]
+  wrist_xyaxes: [0.0, 1.0, 0.0, -0.996, 0.0, -0.087]
+  wrist_fovy: 70.0
+  tripod_pos: [0.36, -0.58, 0.44]
+  tripod_target: [0.38, 0.0, 0.06]
+  tripod_fovy: 48.0
+  overview_pos: [0.32, 0.0, 0.95]
+  overview_target: [0.35, 0.0, 0.05]
+  overview_fovy: 55.0
+
+delivery:
+  max_steps: 80
+  settle_steps: 40
+  ball_rest_vel_thresh: 0.02
+  pin_knock_tilt_deg: 35.0
+  pin_fall_z_thresh: -0.05
+
+reward:
+  pin_knock_reward: 1.0
+  strike_bonus: 1.0
+  ball_progress_weight: 0.25
+  action_smoothness_weight: 0.01
+
+dr:
+  enabled: false
+  ball_spawn_dx: 0.03
+  ball_spawn_dy: 0.05
+  ball_mass_range: [0.030, 0.120]
+  pin_mass_range: [0.015, 0.060]
+  pin_pos_jitter: 0.006
+  pad_roll_friction_scale: [0.6, 1.8]
+  desk_roll_friction_scale: [0.6, 1.8]
+  slide_friction_scale: [0.7, 1.4]
+  joint_damping_scale: [0.7, 1.4]
+  actuator_kp_scale: [0.85, 1.15]
+  tripod_pos_jitter: 0.025
+  tripod_target_jitter: 0.015
+  tripod_fovy_jitter: 2.5
+  wrist_pos_jitter: 0.004
+  wrist_fovy_jitter: 2.5
+  light_pos_jitter: 0.20
+  light_intensity_scale: [0.75, 1.25]
+  color_jitter: 0.08
+  num_distractors: 6
+  brightness_delta: 0.15
+  contrast_scale: [0.85, 1.15]
+  gamma_range: [0.88, 1.12]
+  saturation_scale: [0.85, 1.15]
+  noise_std: 4.0
+  max_shift_px: 3

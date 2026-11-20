@@ -1,0 +1,35 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "so101-bowling-rl"
+version = "0.1.0"
+description = "Sim-to-real dual-camera reinforcement learning (PPO -> SAC) for SO-101 3-pin tabletop bowling"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "mujoco>=3.2.0",
+    "gymnasium>=1.0.0",
+    "numpy>=1.26.0,<2.3.0",
+    "pyyaml>=6.0.1",
+    "torch>=2.5.0",
+    "opencv-python-headless>=4.10.0",
+    "tensorboard>=2.17.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3.0",
+]
+hardware = [
+    "lerobot>=0.5.0",
+    "feetech-servo-sdk>=1.0.0",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/so101_bowling"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
