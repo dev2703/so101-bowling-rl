@@ -67,6 +67,7 @@ class PinConfig:
     belly_radius: float = 0.03435
     neck_radius: float = 0.01615
     base_radius: float = 0.0255
+    foot_radius: float = 0.015
     mass: float = 0.032
     positions: tuple[tuple[float, float], ...] = (
         (0.62, 0.0),
@@ -112,16 +113,16 @@ class TableConfig:
 class CameraConfig:
     render_height: int = 64
     render_width: int = 112
-    wrist_pos: tuple[float, float, float] = (0.042, 0.0, -0.025)
+    wrist_pos: tuple[float, float, float] = (0.045, 0.0, -0.028)
     wrist_xyaxes: tuple[float, float, float, float, float, float] = (
         0.0,
-        1.0,
+        -1.0,
         0.0,
-        -0.996,
+        0.990,
         0.0,
-        -0.087,
+        -0.140,
     )
-    wrist_fovy: float = 70.0
+    wrist_fovy: float = 72.0
     tripod_pos: tuple[float, float, float] = (0.36, -0.58, 0.44)
     tripod_target: tuple[float, float, float] = (0.38, 0.0, 0.06)
     tripod_fovy: float = 48.0
@@ -133,18 +134,34 @@ class CameraConfig:
 @dataclass(frozen=True)
 class DeliveryConfig:
     max_steps: int = 80
-    settle_steps: int = 40
-    ball_rest_vel_thresh: float = 0.02
-    pin_knock_tilt_deg: float = 35.0
-    pin_fall_z_thresh: float = -0.05
+    staging_clearance_m: float = 0.055
+    foul_line_x: float = 0.44
+    release_line_x: float = 0.44
+    min_push_disp_m: float = 0.025
+    min_launch_speed_mps: float = 0.25
+    target_launch_speed_mps: float = 0.95
+    aim_sigma_rad: float = 0.14
+    sep_dist_m: float = 0.015
+    sep_duration_s: float = 0.025
+    wobble_tilt_deg: float = 12.0
+    full_fall_tilt_deg: float = 45.0
+    wobble_duration_s: float = 0.02
+    off_table_z_m: float = -0.05
+    quiet_vel_mps: float = 0.02
+    quiet_dwell_s: float = 0.25
+    max_coast_s: float = 2.5
 
 
 @dataclass(frozen=True)
 class RewardConfig:
-    pin_knock_reward: float = 1.0
-    strike_bonus: float = 1.0
-    ball_progress_weight: float = 0.25
-    action_smoothness_weight: float = 0.01
+    gamma: float = 0.99
+    w_stage_phi: float = 0.40
+    w_contact_speed: float = 0.60
+    w_launch_angle: float = 0.60
+    w_action_jerk: float = 0.005
+    r_pin_credit: float = 5.0
+    r_strike_bonus: float = 5.0
+    r_illegal_penalty: float = -2.0
 
 
 @dataclass(frozen=True)

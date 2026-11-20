@@ -1,7 +1,7 @@
 """Dual-camera MuJoCo environment for SO-101 tabletop bowling."""
 
 from collections import deque
-from dataclasses import asdict, fields, replace
+from dataclasses import asdict, replace
 
 import cv2
 import gymnasium as gym
@@ -42,17 +42,17 @@ class SO101BowlingEnv(gym.Env):
         self,
         cfg: WorkspaceConfig | None = None,
         cal: CalibrationMap | None = None,
-        dr_enabled: bool = False,
+        dr_enabled: bool | None = None,
         render_rgb: bool = True,
         frame_stack: int = 2,
-        gamma: float = 0.99,
+        gamma: float | None = None,
         scorer_cfg: ScorerConfig | None = None,
         seed: int | None = None,
     ):
         super().__init__()
         self.cfg = cfg if cfg is not None else load_config()
         self.cal = cal if cal is not None else load_calibration()
-        self.dr_enabled = dr_enabled
+        self.dr_enabled = self.cfg.dr.enabled if dr_enabled is None else dr_enabled
         self.render_rgb = render_rgb
         self._initial_seed = seed
         self._renderer = None
@@ -68,6 +68,14 @@ class SO101BowlingEnv(gym.Env):
         self.randomizer = DomainRandomizer(self.model, ids, cfg)
         self._scene_option = mujoco.MjvOption()
         self._scene_option.geomgroup[3] = 0
+        if self.render_rgb:
+            self._renderer = mujoco.Renderer(self.model, height=self.height, width=self.width)
+            # Warm up the offscreen GL context once so episode 0 matches subsequent resets bit-for-bit.
+            mujoco.mj_forward(self.model, self.data)
+            self._renderer.update_scene(self.data, camera="wrist_cam", scene_option=self._scene_option)
+            self._renderer.render()
+        else:
+            self._renderer = None
         self._camera_ids = (ids.wrist_cam_id, ids.tripod_cam_id)
         self._camera_names = ("wrist_cam", "tripod_cam")
         limits = intersect_joint_limits(self.cal)
@@ -88,30 +96,40 @@ class SO101BowlingEnv(gym.Env):
 
         self.substeps = round(1.0 / (cfg.robot.control_hz * cfg.robot.physics_dt))
         self._control_dt = self.substeps * cfg.robot.physics_dt
-        self.delivery_timeout_s = getattr(
-            cfg.delivery, "delivery_timeout_s", cfg.delivery.max_steps * self._control_dt
-        )
+        self.delivery_timeout_s = cfg.delivery.max_steps * self._control_dt
         if self.substeps < 1 or self.delivery_timeout_s <= 0 or self.max_action_rad <= 0:
             raise ValueError("Control interval, delivery timeout and action scale must be positive")
         if scorer_cfg is None:
-            defaults = ScorerConfig()
-            overrides = {
-                field.name: getattr(
-                    cfg.delivery, field.name,
-                    getattr(cfg.reward, field.name, getattr(defaults, field.name)),
-                )
-                for field in fields(ScorerConfig)
-            }
-            overrides.update(
-                gamma=gamma,
+            d, r = cfg.delivery, cfg.reward
+            scorer_cfg = ScorerConfig(
+                gamma=r.gamma if gamma is None else gamma,
+                sim_dt=cfg.robot.physics_dt,
                 ball_radius=cfg.ball.radius,
+                staging_clearance_m=d.staging_clearance_m,
+                foul_line_x=d.foul_line_x,
+                release_line_x=d.release_line_x,
                 rack_x_nom=cfg.pin.positions[0][0],
-                min_wobble_substeps=getattr(
-                    cfg.delivery, "min_wobble_substeps",
-                    max(2, round(0.02 / cfg.robot.physics_dt)),
-                ),
+                min_push_disp_m=d.min_push_disp_m,
+                min_launch_speed_mps=d.min_launch_speed_mps,
+                target_launch_speed_mps=d.target_launch_speed_mps,
+                aim_sigma_rad=d.aim_sigma_rad,
+                sep_dist_m=d.sep_dist_m,
+                sep_duration_s=d.sep_duration_s,
+                wobble_tilt_deg=d.wobble_tilt_deg,
+                full_fall_tilt_deg=d.full_fall_tilt_deg,
+                min_wobble_substeps=max(2, round(d.wobble_duration_s / cfg.robot.physics_dt)),
+                off_table_z_m=d.off_table_z_m,
+                quiet_vel_mps=d.quiet_vel_mps,
+                quiet_dwell_s=d.quiet_dwell_s,
+                max_coast_s=d.max_coast_s,
+                w_stage_phi=r.w_stage_phi,
+                w_contact_speed=r.w_contact_speed,
+                w_launch_angle=r.w_launch_angle,
+                w_action_jerk=r.w_action_jerk,
+                r_pin_credit=r.r_pin_credit,
+                r_strike_bonus=r.r_strike_bonus,
+                r_illegal_penalty=r.r_illegal_penalty,
             )
-            scorer_cfg = ScorerConfig(**overrides)
         self.scorer = DeliveryScorer(replace(scorer_cfg, sim_dt=cfg.robot.physics_dt))
 
         self.action_space = spaces.Box(-1.0, 1.0, shape=(len(ACTIVE_JOINTS),), dtype=np.float32)
@@ -162,7 +180,14 @@ class SO101BowlingEnv(gym.Env):
             for _ in self._camera_names
         ]
         max_shift = self.cfg.dr.max_shift_px if self.dr_enabled else 0
-        self._shift = tuple(rng.integers(-max_shift, max_shift + 1, size=2)) if max_shift else (0, 0)
+        self._shifts = [
+            (
+                (int(rng.integers(-max_shift, max_shift + 1)), int(rng.integers(-max_shift, max_shift + 1)))
+                if max_shift
+                else (0, 0)
+            )
+            for _ in self._camera_names
+        ]
         for stack in self._stacks:
             stack.reset()
         obs = self._observation(initial=True)
@@ -219,14 +244,13 @@ class SO101BowlingEnv(gym.Env):
             outcome = self.scorer.finalize_episode(snap, unresolved)
             reward += outcome.total_terminal_reward
             info.update(outcome=asdict(outcome), end_reason=reason)
-        self._last_snapshot = snap
+        mujoco.mj_forward(self.model, self.data)
+        self._last_snapshot = self._snapshot()
         self._needs_reset = done
         return self._observation(), reward, done, False, info
 
     def _advance(self):
         mujoco.mj_step(self.model, self.data)
-        # Refresh derived transforms and contact forces at the integrated state.
-        mujoco.mj_forward(self.model, self.data)
         snap = self._snapshot()
         self.scorer.update_substep(snap)
         return snap
@@ -289,7 +313,7 @@ class SO101BowlingEnv(gym.Env):
         )
 
     def _visible(self, point, body_id):
-        for cam_id in self._camera_ids:
+        for cam_id, shift in zip(self._camera_ids, self._shifts):
             origin = self.data.cam_xpos[cam_id]
             ray = point - origin
             x, y, z = self.data.cam_xmat[cam_id].reshape(3, 3).T @ ray
@@ -298,8 +322,8 @@ class SO101BowlingEnv(gym.Env):
             half_height = -z * np.tan(np.deg2rad(self.model.cam_fovy[cam_id]) / 2)
             half_width = half_height * self.width / self.height
             if (
-                abs(x / half_width + 2 * self._shift[0] / self.width) > 1
-                or abs(y / half_height - 2 * self._shift[1] / self.height) > 1
+                abs(x / half_width + 2 * shift[0] / self.width) > 1
+                or abs(y / half_height - 2 * shift[1] / self.height) > 1
             ):
                 continue
             hit = mujoco.mj_ray(
@@ -315,18 +339,21 @@ class SO101BowlingEnv(gym.Env):
         t = self.data.time
         obs = {}
         meta = []
-        for name, cam, stack, delay in zip(
-            ("wrist_rgb", "tripod_rgb"), self._camera_names, self._stacks, self._delays
+        for name, cam, stack, delay, shift in zip(
+            ("wrist_rgb", "tripod_rgb"), self._camera_names, self._stacks, self._delays, self._shifts
         ):
             if self.render_rgb:
                 rgb = self.render_camera(cam, self.height, self.width)
                 if self.dr_enabled:
-                    rgb = augment_rgb(rgb, self.np_random, True, self._shift)
-                delivered = delay.push(rgb, t)
+                    rgb = augment_rgb(rgb, self.np_random, True, shift, dr_cfg=self.cfg.dr)
                 if initial:
+                    delay.seed(rgb, t)
                     stack.push(rgb, t)
-                elif delivered is not None:
-                    stack.push(*delivered)
+                    delivered = (rgb, t)
+                else:
+                    delivered = delay.push(rgb, t)
+                    if delivered is not None:
+                        stack.push(*delivered)
                 frames = stack.frames
                 obs[name] = np.stack((frames[0],) * (self.frame_stack - len(frames)) + frames)
                 meta.extend((min(10.0, stack.age_s(t)), float(

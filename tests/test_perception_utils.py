@@ -25,7 +25,7 @@ def test_camera_resizes_center_crop_with_target_aspect(height, width):
     np.testing.assert_array_equal(actual, expected)
 
 
-def test_timestamped_stack_keeps_distinct_frames_and_original_capture_times():
+def test_timestamped_stack_accepts_stationary_live_frames_and_rejects_stale_timestamps():
     stack = TimestampedFrameStack()
     frame = np.zeros((2, 2, 3), dtype=np.uint8)
     assert np.isinf(stack.age_s(1.0))
@@ -33,18 +33,37 @@ def test_timestamped_stack_keeps_distinct_frames_and_original_capture_times():
     assert stack.push(frame, 1.0)
     assert stack.is_fresh(1.05, 0.1)
     assert not stack.is_fresh(1.2, 0.1)
+    # Repeated capture timestamp stays stale and preserves original age.
     assert not stack.push(frame.copy(), 1.0)
-    assert not stack.push(frame.copy(), 1.1)
-    assert not stack.is_fresh(1.12, 0.2)
+    assert not stack.is_fresh(1.05, 0.2)
     assert stack.age_s(1.2) == pytest.approx(0.2)
+    # Pixel-identical stationary frame with a newer capture timestamp is fresh.
+    assert stack.push(frame.copy(), 1.1)
+    assert stack.is_fresh(1.12, 0.05)
+    assert stack.timestamps == (1.0, 1.1)
+    # Out-of-order older timestamp is rejected even with different pixels.
     frame[:] = 1
     assert not stack.push(frame, 1.05)
     assert stack.push(frame, 1.2)
-    assert stack.timestamps == (1.0, 1.2)
+    assert stack.timestamps == (1.1, 1.2)
     assert stack.frames[0][0, 0, 0] == 0
     assert stack.push(frame + 1, 1.3)
     assert stack.timestamps == (1.2, 1.3)
     assert stack.is_fresh(1.34, 0.05)
+
+
+def test_camera_delay_seed_initializes_without_duplicate_pending_delivery():
+    buf = CameraDelayBuffer(delay_frames=2)
+    f0 = np.array([10], dtype=np.uint8)
+    buf.seed(f0, 0.0)
+    # First live tick is delayed by 2 frames, so latest stays the seeded frame at t=0.0.
+    delivered = buf.push(np.array([11], dtype=np.uint8), 0.05)
+    assert delivered is not None and delivered[1] == 0.0
+    delivered = buf.push(np.array([12], dtype=np.uint8), 0.10)
+    assert delivered is not None and delivered[1] == 0.0
+    delivered = buf.push(np.array([13], dtype=np.uint8), 0.15)
+    assert delivered is not None and delivered[1] == 0.05
+    np.testing.assert_array_equal(delivered[0], [11])
 
 
 def test_camera_delay_is_per_camera_and_retains_capture_timestamps():

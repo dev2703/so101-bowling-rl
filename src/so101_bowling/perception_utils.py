@@ -49,6 +49,11 @@ class CameraDelayBuffer:
         self._pending: list[tuple[int, int, float, np.ndarray]] = []
         self._latest: tuple[np.ndarray, float] | None = None
 
+    def seed(self, frame: np.ndarray, capture_t: float) -> None:
+        """Initialize delivered state at episode reset without queueing a duplicate tick."""
+        self.reset()
+        self._latest = (frame.copy(), capture_t)
+
     def push(self, frame: np.ndarray, capture_t: float) -> tuple[np.ndarray, float] | None:
         self._tick += 1
         if self.drop_probability == 0.0 or self.rng.random() >= self.drop_probability:
@@ -87,13 +92,10 @@ class TimestampedFrameStack:
         self._last_seen_t = -np.inf
 
     def push(self, frame: np.ndarray, capture_t: float) -> bool:
-        """Keep distinct captures and report whether the stack advanced."""
-        in_order = capture_t > self._last_seen_t
-        self._last_seen_t = max(self._last_seen_t, capture_t)
-        self._fresh = in_order and (
-            not self._samples or not np.array_equal(self._samples[-1][0], frame)
-        )
+        """Accept strictly newer capture timestamps; repeated timestamps stay stale."""
+        self._fresh = capture_t > self._last_seen_t
         if self._fresh:
+            self._last_seen_t = capture_t
             self._samples.append((frame.copy(), capture_t))
         return self._fresh
 
