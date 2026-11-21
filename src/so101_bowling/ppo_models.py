@@ -132,12 +132,14 @@ class DualCameraActor(nn.Module):
         action_dim: int = ACTION_DIM,
         encoder_type: str = "spatial_grid",
         img_hw: tuple[int, int] = (64, 112),
+        squashed: bool = False,
     ) -> None:
         super().__init__()
         self.frame_stack = frame_stack
         self.action_dim = action_dim
         self.img_hw = img_hw
         self.encoder_type = encoder_type
+        self.squashed = bool(squashed)
 
         self.wrist_encoder = SpatialCameraEncoder(
             frame_stack=frame_stack, out_dim=128, encoder_type=encoder_type, img_hw=img_hw
@@ -194,6 +196,20 @@ class DualCameraActor(nn.Module):
         std = torch.exp(self.log_std.clamp(-5.0, 2.0)).expand_as(mean)
         return Normal(mean, std), z_vis
 
+    def sample_squashed(
+        self,
+        obs: Mapping[str, Tensor],
+        wrist_shifts: Tensor | None = None,
+        tripod_shifts: Tensor | None = None,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        """Reparameterized tanh-squashed sample with numerically stable log-prob."""
+        dist, z_vis = self.forward_actor(obs, wrist_shifts=wrist_shifts, tripod_shifts=tripod_shifts)
+        u = dist.rsample()
+        action = torch.tanh(u)
+        log_det = 2.0 * (math.log(2.0) - u - F.softplus(-2.0 * u))
+        log_prob = dist.log_prob(u).sum(dim=-1) - log_det.sum(dim=-1)
+        return action, log_prob, z_vis
+
     @torch.no_grad()
     def act(
         self,
@@ -216,8 +232,11 @@ class DualCameraActor(nn.Module):
             actor_obs[key] = t.to(device=device)
 
         dist, _ = self.forward_actor(actor_obs)
-        raw = dist.mean if deterministic else dist.sample()
-        action = torch.clamp(raw, -1.0, 1.0)
+        if self.squashed:
+            action = torch.tanh(dist.mean) if deterministic else torch.tanh(dist.sample())
+        else:
+            raw = dist.mean if deterministic else dist.sample()
+            action = torch.clamp(raw, -1.0, 1.0)
         return action.squeeze(0) if unbatched else action
 
     def export_payload(self) -> dict[str, Any]:
@@ -228,6 +247,7 @@ class DualCameraActor(nn.Module):
                 "action_dim": self.action_dim,
                 "encoder_type": self.encoder_type,
                 "img_hw": list(self.img_hw),
+                "squashed": self.squashed,
             },
         }
 
@@ -246,6 +266,7 @@ def load_actor(
     cfg = dict(payload["config"])
     height, width = cfg.get("img_hw", (64, 112))
     cfg["img_hw"] = (height, width)
+    cfg.setdefault("squashed", False)
     actor = DualCameraActor(**cfg)
     actor.load_state_dict(payload["state_dict"], strict=True)
     actor.to(map_location)
