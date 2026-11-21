@@ -1,0 +1,22 @@
+# SO-101 Real Hardware Bridge Configuration
+
+port: /dev/tty.usbmodem0000
+calibration_path: null
+
+wrist_cam_index: 0
+tripod_cam_index: 1
+cam_width: 1280
+cam_height: 720
+cam_fps: 25
+wrist_rotation_deg: 180
+tripod_rotation_deg: 0
+
+control_hz: 20.0
+z_floor_margin_m: 0.015
+foul_line_x: 0.44
+stopping_margin_rad: 0.015
+max_joint_stale_s: 0.15
+max_camera_age_s: 0.20
+max_joint_read_latency_s: 0.05
+
+dry_run: true
