@@ -4,7 +4,7 @@ port: /dev/tty.usbmodem0000
 calibration_path: null
 
 wrist_cam_index: 0
-tripod_cam_index: 1
+tripod_cam_index: 2
 cam_width: 1280
 cam_height: 720
 cam_fps: 25
