@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -86,9 +87,42 @@ def _ensure_train_args(raw_args: list[str], remote_run_dir: str) -> list[str]:
     cleaned = list(raw_args)
     if cleaned and cleaned[0] == "--":
         cleaned = cleaned[1:]
-    if "--run-dir" not in cleaned:
+    if not any(a == "--run-dir" or a.startswith("--run-dir=") for a in cleaned):
         cleaned.extend(["--run-dir", remote_run_dir])
     return cleaned
+
+
+def _session_in_output(session: str, stdout: str) -> bool:
+    if not session or not stdout:
+        return False
+    pattern = re.compile(rf"(?<![A-Za-z0-9_.-]){re.escape(session)}(?![A-Za-z0-9_.-])")
+    return any(pattern.search(line) for line in stdout.splitlines())
+
+
+def _parse_json_output(stdout: str) -> dict[str, Any] | None:
+    stripped = stdout.strip()
+    if not stripped:
+        return None
+    try:
+        parsed = json.loads(stripped)
+        return parsed if isinstance(parsed, dict) else None
+    except json.JSONDecodeError:
+        pass
+    lines = stripped.splitlines()
+    last_line = (lines or [""])[-1]
+    try:
+        parsed = json.loads(last_line)
+        return parsed if isinstance(parsed, dict) else None
+    except json.JSONDecodeError:
+        pass
+    for idx in range(len(lines) - 1, -1, -1):
+        if lines[idx].lstrip().startswith("{"):
+            try:
+                parsed = json.loads("\n".join(lines[idx:]))
+                return parsed if isinstance(parsed, dict) else None
+            except json.JSONDecodeError:
+                continue
+    return None
 
 
 def build_bootstrap_script(
@@ -158,9 +192,11 @@ def build_spawn_script(
     remote_run_dir: str,
     train_args: list[str],
     session: str,
+    hf_token_remote_tmp: str = "/content/.hf_token_tmp",
 ) -> str:
     return f"""import json
 import os
+import shutil
 import subprocess
 import time
 from pathlib import Path
@@ -168,6 +204,14 @@ from pathlib import Path
 repo_dir = Path({remote_repo_dir!r})
 run_dir = Path({remote_run_dir!r})
 run_dir.mkdir(parents=True, exist_ok=True)
+token_tmp = Path({hf_token_remote_tmp!r})
+
+if token_tmp.exists():
+    hf_dir = Path.home() / ".cache" / "huggingface"
+    hf_dir.mkdir(parents=True, exist_ok=True)
+    hf_tok = hf_dir / "token"
+    shutil.move(str(token_tmp), str(hf_tok))
+    os.chmod(hf_tok, 0o600)
 
 venv_python = str(repo_dir / ".venv" / "bin" / "python")
 cmd = [venv_python, "scripts/colab_train.py", *{train_args!r}]
@@ -262,7 +306,7 @@ def cmd_launch(args: argparse.Namespace, colab_prefix: list[str]) -> dict[str, A
     train_args = _ensure_train_args(args.train_args or [], args.remote_run_dir)
 
     sessions_res = _run_cmd([*colab_prefix, "sessions"], dry_run=dry_run, check=False)
-    session_exists = (not dry_run) and (session in sessions_res.stdout)
+    session_exists = (not dry_run) and _session_in_output(session, sessions_res.stdout)
     if not session_exists:
         new_cmd = [*colab_prefix, "new", "-s", session]
         if args.gpu:
@@ -329,10 +373,9 @@ def cmd_launch(args: argparse.Namespace, colab_prefix: list[str]) -> dict[str, A
         }
     if spawn_res.stdout.strip():
         print(spawn_res.stdout.strip(), flush=True)
-        try:
-            return json.loads(spawn_res.stdout.strip().splitlines()[-1] if "\n" not in spawn_res.stdout.strip() else spawn_res.stdout.strip())
-        except json.JSONDecodeError:
-            pass
+        parsed = _parse_json_output(spawn_res.stdout)
+        if parsed is not None:
+            return parsed
     return {"session": session, "remote_run_dir": args.remote_run_dir, "raw_output": spawn_res.stdout}
 
 

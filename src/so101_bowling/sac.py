@@ -394,6 +394,7 @@ def _save_sac_checkpoint(
     best_eval: dict[str, Any] | None = None,
     utd_carry: float = 0.0,
     last_log: dict[str, Any] | None = None,
+    last_eval: dict[str, Any] | None = None,
 ) -> None:
     torch.save(
         {
@@ -405,6 +406,7 @@ def _save_sac_checkpoint(
             "total_critic_updates": total_critic_updates,
             "best_score": list(best_score) if best_score is not None else None,
             "best_eval": dict(best_eval) if best_eval is not None else {},
+            "last_eval": dict(last_eval) if last_eval is not None else {},
             "utd_carry": float(utd_carry),
             "last_log": dict(last_log) if last_log is not None else {},
             "sac_cfg": asdict(cfg),
@@ -752,11 +754,16 @@ def train_sac(
         global_step = int(ckpt.get("global_step", 0))
         total_critic_updates = int(ckpt.get("total_critic_updates", 0))
         utd_carry = float(ckpt.get("utd_carry", 0.0))
+        prev_summary: dict[str, Any] = {}
+        summary_candidate = ckpt_path.parent / "summary.json"
+        if not summary_candidate.exists() and (out_dir / "summary.json").exists():
+            summary_candidate = out_dir / "summary.json"
+        if summary_candidate.exists():
+            prev_summary = json.loads(summary_candidate.read_text())
         if "best_score" in ckpt and ckpt["best_score"] is not None:
             best_score = tuple(float(x) for x in ckpt["best_score"])
             best_eval = dict(ckpt.get("best_eval", {}))
-        elif (ckpt_path.parent / "summary.json").exists():
-            prev_summary = json.loads((ckpt_path.parent / "summary.json").read_text())
+        elif prev_summary:
             prev_be = prev_summary.get("best_eval") or {}
             if prev_be:
                 best_eval = dict(prev_be)
@@ -765,8 +772,16 @@ def train_sac(
                     float(prev_be.get("mean_credited_pins", -1.0)),
                     float(prev_be.get("mean_return", -float("inf"))),
                 )
+        if "last_eval" in ckpt and ckpt["last_eval"]:
+            last_eval = dict(ckpt["last_eval"])
+        elif prev_summary and prev_summary.get("final_eval"):
+            last_eval = dict(prev_summary["final_eval"])
+        elif best_eval:
+            last_eval = dict(best_eval)
         if "last_log" in ckpt and ckpt["last_log"]:
             last_log = dict(ckpt["last_log"])
+        elif prev_summary and prev_summary.get("last_metrics"):
+            last_log = dict(prev_summary["last_metrics"])
     elif metrics_path.exists():
         metrics_path.unlink()
 
@@ -1035,6 +1050,7 @@ def train_sac(
                         best_eval=best_eval,
                         utd_carry=utd_carry,
                         last_log=last_log,
+                        last_eval=last_eval,
                     )
 
             agent.actor.save_actor(out_dir / "actor_latest.pt")
@@ -1073,6 +1089,7 @@ def train_sac(
             best_eval=best_eval,
             utd_carry=utd_carry,
             last_log=last_log,
+            last_eval=last_eval,
         )
         _write_sac_summary(
             out_dir,

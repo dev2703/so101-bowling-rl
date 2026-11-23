@@ -246,22 +246,31 @@ def main(argv: list[str] | None = None) -> None:
         if args.preflight:
             _write_status(status_path, "preflight", {"algo": args.algo})
             print(f"[colab_train] stage=preflight algo={args.algo}", flush=True)
-            if args.algo == "sac":
-                sac_cfg = replace(load_sac_config(args.config), **_build_sac_overrides(args))
-                report = preflight_sac(
-                    cfg=sac_cfg,
-                    workspace_cfg=wcfg,
-                    steps=args.preflight_steps,
-                    batch_size=args.preflight_batch_size,
-                )
-            else:
-                ppo_cfg = replace(load_ppo_config(args.config), **_build_ppo_overrides(args))
-                report = preflight_ppo(
-                    ppo_cfg=ppo_cfg,
-                    workspace_cfg=wcfg,
-                    steps=args.preflight_steps,
-                    batch_size=args.preflight_batch_size,
-                )
+            try:
+                if args.algo == "sac":
+                    sac_cfg = replace(load_sac_config(args.config), **_build_sac_overrides(args))
+                    report = preflight_sac(
+                        cfg=sac_cfg,
+                        workspace_cfg=wcfg,
+                        steps=args.preflight_steps,
+                        batch_size=args.preflight_batch_size,
+                    )
+                else:
+                    ppo_cfg = replace(load_ppo_config(args.config), **_build_ppo_overrides(args))
+                    report = preflight_ppo(
+                        ppo_cfg=ppo_cfg,
+                        workspace_cfg=wcfg,
+                        steps=args.preflight_steps,
+                        batch_size=args.preflight_batch_size,
+                    )
+            except FloatingPointError as exc:
+                report = {
+                    "algo": args.algo,
+                    "passed": False,
+                    "nan_inf_detected": True,
+                    "checks": {"finite_ok": False},
+                    "failure_reasons": [str(exc)],
+                }
             (run_dir / "preflight_report.json").write_text(
                 json.dumps(report, indent=2) + "\n", encoding="utf-8"
             )

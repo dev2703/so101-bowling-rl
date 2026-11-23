@@ -194,6 +194,13 @@ class DualCameraActor(nn.Module):
         h = self.trunk(torch.cat((z_vis, z_prop), dim=-1))
         mean = self.mean_head(h)
         std = torch.exp(self.log_std.clamp(-5.0, 2.0)).expand_as(mean)
+        if not (
+            torch.isfinite(z_vis).all()
+            and torch.isfinite(h).all()
+            and torch.isfinite(mean).all()
+            and torch.isfinite(std).all()
+        ):
+            raise FloatingPointError("Non-finite actor distribution parameters (mean/std)")
         return Normal(mean, std), z_vis
 
     def sample_squashed(

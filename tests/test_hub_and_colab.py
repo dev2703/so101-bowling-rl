@@ -425,3 +425,86 @@ def test_launch_colab_command_construction(
     assert "MUJOCO_GL" in captured_scripts[1]
     assert secret_token not in captured_scripts[0]
     assert secret_token not in captured_scripts[1]
+
+
+def test_launch_colab_edge_cases(monkeypatch: pytest.MonkeyPatch) -> None:
+    import ast
+    import importlib.util
+    import subprocess
+
+    repo_root = Path(__file__).resolve().parents[1]
+    spec = importlib.util.spec_from_file_location(
+        "launch_colab_edge", repo_root / "scripts" / "launch_colab.py"
+    )
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    # 1. --run-dir= syntax preserved; unrelated --run-dir-extra still gets default --run-dir.
+    assert mod._ensure_train_args(
+        ["--", "--algo", "sac", "--run-dir=/content/runs/eq_dir"],
+        "/content/runs/default",
+    ) == ["--algo", "sac", "--run-dir=/content/runs/eq_dir"]
+    assert mod._ensure_train_args(
+        ["--", "--algo", "sac", "--run-dir", "/content/runs/sp_dir"],
+        "/content/runs/default",
+    ) == ["--algo", "sac", "--run-dir", "/content/runs/sp_dir"]
+    assert mod._ensure_train_args(
+        ["--", "--algo", "sac", "--run-dir-extra", "x"],
+        "/content/runs/default",
+    ) == ["--algo", "sac", "--run-dir-extra", "x", "--run-dir", "/content/runs/default"]
+
+    # 2. Exact session matching ignores superstring session names like bowling-test-2.
+    assert mod._session_in_output("bowling-test", "bowling-test-2  running\n") is False
+    assert mod._session_in_output("bowling-test", "my_bowling-test  running\n") is False
+    assert mod._session_in_output("bowling-test", "| bowling-test | T4 | running |\n") is True
+    assert mod._session_in_output("bowling-test", '"name": "bowling-test"\n') is True
+
+    # 3. --skip-bootstrap + --forward-hf-token moves token in spawn.py, and multi-line stdout parses JSON.
+    monkeypatch.setenv("HF_TOKEN", "hf_edge_token_abc")
+    recorded_cmds: list[list[str]] = []
+    spawn_scripts: list[str] = []
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        recorded_cmds.append(list(cmd))
+        if "-f" in cmd:
+            f_idx = cmd.index("-f") + 1
+            spawn_scripts.append(Path(cmd[f_idx]).read_text(encoding="utf-8"))
+        if "sessions" in cmd:
+            return subprocess.CompletedProcess(cmd, 0, stdout="bowling-test-2  T4\n", stderr="")
+        if "exec" in cmd and "--timeout" in cmd and "30" in cmd:
+            multiline_stdout = (
+                "Connecting to runtime...\n"
+                "Executing script...\n"
+                '{"session": "bowling-test", "pid": 9876, "remote_run_dir": "/content/runs/custom"}'
+            )
+            return subprocess.CompletedProcess(cmd, 0, stdout=multiline_stdout, stderr="")
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(mod.subprocess, "run", fake_run)
+    args = mod.parse_args(
+        [
+            "launch",
+            "-s",
+            "bowling-test",
+            "--skip-bootstrap",
+            "--",
+            "--algo",
+            "sac",
+            "--run-dir=/content/runs/custom",
+        ]
+    )
+    res = mod.cmd_launch(args, ["colab"])
+    assert any("new" in c and "bowling-test" in c for c in recorded_cmds)
+    assert res["pid"] == 9876
+    assert res["remote_run_dir"] == "/content/runs/custom"
+    assert len(spawn_scripts) == 1
+    ast.parse(spawn_scripts[0])
+    assert "/content/.hf_token_tmp" in spawn_scripts[0]
+    assert "0o600" in spawn_scripts[0]
+
+    # Also verify pretty-printed multi-line JSON with banner header parses cleanly.
+    pretty = mod._parse_json_output(
+        "Banner line\n" + json.dumps({"session": "s", "pid": 42}, indent=2) + "\n"
+    )
+    assert pretty == {"session": "s", "pid": 42}

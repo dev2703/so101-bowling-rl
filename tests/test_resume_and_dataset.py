@@ -323,3 +323,68 @@ def test_sac_demo_pretrain_steps_and_immediate_updates(tmp_path: Path) -> None:
     assert summary["demo_pretrain_steps_run"] == 3
     # 3 pretrain updates + 4 immediate online updates despite learning_starts=1000.
     assert summary["total_critic_updates"] == 7
+
+
+def test_ppo_and_sac_noop_resume_preserves_final_eval(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from so101_bowling import ppo as ppo_mod
+    from so101_bowling import sac as sac_mod
+    from so101_bowling.ppo import PPOConfig, train_ppo
+    from so101_bowling.sac import train_sac
+
+    wcfg = load_config()
+    eval_payload = {
+        "episodes": 1,
+        "legal_strike_rate": 0.5,
+        "mean_credited_pins": 2.0,
+        "mean_full_knock_pins": 2.0,
+        "mean_wobble_only_pins": 0.0,
+        "illegal_rate": 0.0,
+        "mean_return": 12.5,
+        "mean_episode_steps": 45.0,
+        "eval_aux_loss": 0.015,
+    }
+    monkeypatch.setattr(ppo_mod, "evaluate_actor", lambda **kwargs: dict(eval_payload))
+    monkeypatch.setattr(sac_mod, "evaluate_actor", lambda **kwargs: dict(eval_payload))
+
+    # 1. PPO no-op resume (total_timesteps already reached)
+    ppo_dir = tmp_path / "ppo_noop"
+    ppo_cfg = PPOConfig(
+        num_envs=1,
+        rollout_steps=4,
+        total_timesteps=4,
+        minibatch_size=4,
+        eval_interval_updates=1,
+        checkpoint_interval_updates=1,
+        eval_episodes=1,
+        save_video=False,
+        device="cpu",
+    )
+    train_ppo(ppo_cfg, workspace_cfg=wcfg, run_dir=ppo_dir)
+    ppo_noop_summary = train_ppo(
+        ppo_cfg, workspace_cfg=wcfg, run_dir=ppo_dir, resume_from=ppo_dir / "latest.pt"
+    )
+    assert ppo_noop_summary["final_eval"] == eval_payload
+    assert ppo_noop_summary["eval_aux_loss"] == 0.015
+
+    # 2. SAC no-op resume (total_timesteps already reached)
+    sac_dir = tmp_path / "sac_noop"
+    sac_cfg = SACConfig(
+        num_envs=1,
+        capacity=32,
+        batch_size=4,
+        learning_starts=0,
+        total_timesteps=4,
+        eval_interval_steps=4,
+        checkpoint_interval_steps=4,
+        eval_episodes=1,
+        save_video=False,
+        device="cpu",
+    )
+    train_sac(sac_cfg, workspace_cfg=wcfg, run_dir=sac_dir)
+    sac_noop_summary = train_sac(
+        sac_cfg, workspace_cfg=wcfg, run_dir=sac_dir, resume_from=sac_dir / "checkpoint_latest.pt"
+    )
+    assert sac_noop_summary["final_eval"] == eval_payload
+    assert sac_noop_summary["eval_aux_loss"] == 0.015
