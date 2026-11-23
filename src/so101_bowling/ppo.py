@@ -9,11 +9,12 @@ from contextlib import ExitStack
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from time import perf_counter
-from typing import Any, Mapping
+from typing import Any, Iterable, Mapping
 
 import cv2
 import numpy as np
 import torch
+import torch.nn.functional as F
 import yaml
 from torch import Tensor, nn
 from torch.utils.tensorboard import SummaryWriter
@@ -36,6 +37,48 @@ from so101_bowling.vec_env import make_vec_env
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _DEFAULT_PPO_YAML = _REPO_ROOT / "configs" / "ppo.yaml"
+
+VALIDATION_LOSS_NOTE = (
+    "RL policy and critic losses optimize non-stationary expected returns rather than a fixed "
+    "supervised validation loss; eval_aux_loss measures held-out supervised SmoothL1 loss on "
+    "visible privileged_aux_targets during deterministic evaluation rollouts."
+)
+
+
+def _assert_finite_tensor(name: str, t: Tensor) -> None:
+    if not torch.isfinite(t).all():
+        nan_count = int(torch.isnan(t).sum().item())
+        inf_count = int(torch.isinf(t).sum().item())
+        fin = t[torch.isfinite(t)]
+        fmin = float(fin.min().item()) if fin.numel() > 0 else float("nan")
+        fmax = float(fin.max().item()) if fin.numel() > 0 else float("nan")
+        raise FloatingPointError(
+            f"Non-finite tensor {name}: shape={tuple(t.shape)} nan={nan_count} "
+            f"inf={inf_count} finite_min={fmin} finite_max={fmax}"
+        )
+
+
+def _assert_finite_mapping(prefix: str, items: Mapping[str, float | Tensor]) -> None:
+    for key, val in items.items():
+        full_name = f"{prefix}.{key}"
+        if isinstance(val, Tensor):
+            _assert_finite_tensor(full_name, val)
+        elif isinstance(val, (int, float)) and not isinstance(val, bool):
+            if not math.isfinite(float(val)):
+                raise FloatingPointError(f"Non-finite scalar {full_name}: {val}")
+
+
+def _module_grad_and_param_stats(params: Iterable[nn.Parameter]) -> tuple[float, float]:
+    grad_sq_sum = 0.0
+    max_abs_param = 0.0
+    for idx, p in enumerate(params):
+        _assert_finite_tensor(f"param[{idx}]", p.data)
+        if p.data.numel() > 0:
+            max_abs_param = max(max_abs_param, float(p.data.detach().abs().max().item()))
+        if p.grad is not None:
+            _assert_finite_tensor(f"grad[{idx}]", p.grad)
+            grad_sq_sum += float(p.grad.detach().pow(2).sum().item())
+    return math.sqrt(grad_sq_sum), max_abs_param
 
 
 @dataclass(frozen=True)
@@ -331,6 +374,7 @@ def evaluate_actor(
     device: torch.device | str = "cpu",
     video_path: str | Path | None = None,
     occlude_camera: str | None = None,
+    aux_head: nn.Module | None = None,
 ) -> dict[str, Any]:
     """Evaluate standalone DualCameraActor deterministically without privileged inputs."""
     if episodes <= 0:
@@ -342,12 +386,25 @@ def evaluate_actor(
     target_device = torch.device(device)
     actor.to(target_device)
 
+    aux_was_training: bool | None = None
+    aux_orig_device: torch.device | None = None
+    if aux_head is not None:
+        aux_was_training = aux_head.training
+        aux_params = list(aux_head.parameters())
+        if aux_params:
+            aux_orig_device = aux_params[0].device
+        aux_head.eval()
+        aux_head.to(target_device)
+
     strikes = 0
     illegals = 0
     credited_list: list[int] = []
     full_knock_list: list[int] = []
     wobble_only_list: list[int] = []
     returns: list[float] = []
+    steps_list: list[int] = []
+    aux_err_sum = 0.0
+    aux_weight_sum = 0.0
 
     writer = None
     vid_h, vid_w = 2 * cfg.camera.render_height, 2 * cfg.camera.render_width
@@ -368,9 +425,11 @@ def evaluate_actor(
             for ep in range(episodes):
                 obs, _ = env.reset(seed=seed + ep)
                 ep_ret = 0.0
+                ep_steps = 0
                 done = False
                 info: dict[str, Any] = {}
                 while not done:
+                    ep_steps += 1
                     if writer is not None and ep == 0:
                         w_img = env.render_camera("wrist_cam", vid_h, vid_w)
                         t_img = env.render_camera("tripod_cam", vid_h, vid_w)
@@ -379,7 +438,39 @@ def evaluate_actor(
 
                     actor_obs = {k: obs[k] for k in ACTOR_OBS_KEYS}
                     actor_obs = _apply_occlusion(actor_obs, occlude_camera)
-                    action = actor.act(actor_obs, deterministic=True).cpu().numpy()
+                    if aux_head is not None:
+                        batched_actor_obs = {
+                            k: torch.as_tensor(actor_obs[k], device=target_device).unsqueeze(0)
+                            for k in ACTOR_OBS_KEYS
+                        }
+                        dist, z_vis = actor.forward_actor(batched_actor_obs)
+                        action_t = (
+                            torch.tanh(dist.mean)
+                            if actor.squashed
+                            else torch.clamp(dist.mean, -1.0, 1.0)
+                        )
+                        action = action_t.squeeze(0).cpu().numpy()
+
+                        aux_pred = aux_head(z_vis)
+                        aux_targets = torch.as_tensor(
+                            obs["privileged_aux_targets"],
+                            device=target_device,
+                            dtype=aux_pred.dtype,
+                        ).unsqueeze(0)
+                        aux_mask = torch.as_tensor(
+                            obs["privileged_aux_mask"],
+                            device=target_device,
+                            dtype=aux_pred.dtype,
+                        ).unsqueeze(0)
+                        weights = aux_mask.repeat_interleave(2, dim=-1)
+                        per_elem = (
+                            F.smooth_l1_loss(aux_pred, aux_targets, reduction="none") * weights
+                        )
+                        aux_err_sum += float(per_elem.sum().item())
+                        aux_weight_sum += float(weights.sum().item())
+                    else:
+                        action = actor.act(actor_obs, deterministic=True).cpu().numpy()
+
                     obs, reward, terminated, truncated, info = env.step(action)
                     ep_ret += float(reward)
                     done = terminated or truncated
@@ -400,15 +491,21 @@ def evaluate_actor(
                 full_knock_list.append(int(outcome.get("full_knock_pins", 0)))
                 wobble_only_list.append(int(outcome.get("wobble_only_pins", 0)))
                 returns.append(ep_ret)
+                steps_list.append(ep_steps)
     finally:
         if writer is not None:
             writer.release()
         actor.to(orig_device)
         if was_training:
             actor.train()
+        if aux_head is not None:
+            if aux_orig_device is not None:
+                aux_head.to(aux_orig_device)
+            if aux_was_training:
+                aux_head.train()
 
     n = len(returns)
-    return {
+    result: dict[str, Any] = {
         "episodes": len(returns),
         "legal_strike_rate": strikes / n,
         "mean_credited_pins": float(np.mean(credited_list)),
@@ -416,7 +513,13 @@ def evaluate_actor(
         "mean_wobble_only_pins": float(np.mean(wobble_only_list)),
         "illegal_rate": illegals / n,
         "mean_return": float(np.mean(returns)),
+        "mean_episode_steps": float(np.mean(steps_list)),
     }
+    if aux_head is not None:
+        result["eval_aux_loss"] = (
+            float(aux_err_sum / aux_weight_sum) if aux_weight_sum > 0.0 else None
+        )
+    return result
 
 
 def evaluate_camera_ablation(
@@ -478,6 +581,333 @@ def _validate_ppo_config(cfg: PPOConfig) -> None:
         raise ValueError("drq_pad_px must be nonnegative")
 
 
+def _extract_ppo_final_losses(last_log: Mapping[str, Any]) -> dict[str, float]:
+    keys = ("policy_loss", "value_loss", "aux_loss", "entropy", "approx_kl", "post_update_kl")
+    return {
+        k: float(last_log[k])
+        for k in keys
+        if k in last_log and isinstance(last_log[k], (int, float)) and not isinstance(last_log[k], bool)
+    }
+
+
+def _write_ppo_summary(
+    out_dir: Path,
+    *,
+    global_step: int,
+    total_timesteps: int,
+    best_eval: dict[str, Any],
+    last_eval: dict[str, Any],
+    last_log: dict[str, Any],
+    nan_inf_detected: bool,
+    nan_inf_error: str | None = None,
+    interrupted: bool = False,
+) -> dict[str, Any]:
+    eval_aux_loss = last_eval.get("eval_aux_loss")
+    if eval_aux_loss is None and best_eval:
+        eval_aux_loss = best_eval.get("eval_aux_loss")
+    summary: dict[str, Any] = {
+        "run_dir": str(out_dir),
+        "global_step": int(global_step),
+        "total_timesteps": int(total_timesteps),
+        "best_eval": best_eval,
+        "final_eval": last_eval,
+        "last_metrics": last_log,
+        "final_losses": _extract_ppo_final_losses(last_log),
+        "eval_aux_loss": eval_aux_loss,
+        "nan_inf_detected": bool(nan_inf_detected),
+        "validation_loss_note": VALIDATION_LOSS_NOTE,
+    }
+    if nan_inf_error is not None:
+        summary["nan_inf_error"] = nan_inf_error
+    if interrupted:
+        summary["interrupted"] = True
+    (out_dir / "summary.json").write_text(json.dumps(summary, indent=2))
+    return summary
+
+
+def preflight_ppo(
+    ppo_cfg: PPOConfig,
+    workspace_cfg: WorkspaceConfig | None = None,
+    *,
+    steps: int = 150,
+    batch_size: int | None = None,
+) -> dict[str, Any]:
+    """Run deterministic single-batch overfit and numerical stability verification for Asymmetric PPO."""
+    _validate_ppo_config(ppo_cfg)
+    if steps <= 0:
+        raise ValueError("steps must be positive")
+    wcfg = workspace_cfg if workspace_cfg is not None else load_config()
+    rng = _set_seed(ppo_cfg.seed)
+    device = resolve_device(ppo_cfg.device)
+    img_hw = (wcfg.camera.render_height, wcfg.camera.render_width)
+
+    target_batch = min(batch_size or ppo_cfg.minibatch_size, 32)
+    if target_batch < 1:
+        raise ValueError("batch_size must be positive")
+    max_collect = max(target_batch, 32)
+
+    agent = AsymmetricPPOAgent(
+        frame_stack=ppo_cfg.frame_stack,
+        action_dim=ACTION_DIM,
+        encoder_type=ppo_cfg.encoder_type,
+        img_hw=img_hw,
+    ).to(device)
+    optimizer = torch.optim.Adam(agent.parameters(), lr=ppo_cfg.lr, eps=1e-5)
+
+    obs_seq: list[dict[str, np.ndarray]] = []
+    act_seq: list[Tensor] = []
+    logp_seq: list[Tensor] = []
+    val_seq: list[Tensor] = []
+    rew_seq: list[float] = []
+    term_seq: list[bool] = []
+    trunc_seq: list[bool] = []
+    final_val_seq: list[float] = []
+
+    agent.eval()
+    with SO101BowlingEnv(
+        cfg=wcfg,
+        dr_enabled=ppo_cfg.dr_enabled,
+        render_rgb=True,
+        frame_stack=ppo_cfg.frame_stack,
+        gamma=ppo_cfg.gamma,
+    ) as env:
+        obs, _ = env.reset(seed=ppo_cfg.seed)
+        active_mask_count = 0.0
+        for step_idx in range(max_collect):
+            with torch.no_grad():
+                obs_t = {
+                    k: torch.as_tensor(v, device=device).unsqueeze(0)
+                    for k, v in obs.items()
+                }
+                action, logprob, _, value, _ = agent.get_action_and_value(obs_t)
+            clipped_action = np.clip(action.squeeze(0).cpu().numpy(), -1.0, 1.0)
+            next_obs, reward, terminated, truncated, _ = env.step(clipped_action)
+            final_val = 0.0
+            if truncated and not terminated:
+                with torch.no_grad():
+                    n_obs_t = {
+                        k: torch.as_tensor(v, device=device).unsqueeze(0)
+                        for k, v in next_obs.items()
+                    }
+                    final_val = float(agent.get_value(n_obs_t).squeeze(0).cpu().item())
+
+            obs_seq.append(obs)
+            act_seq.append(action.squeeze(0).detach().cpu())
+            logp_seq.append(logprob.squeeze(0).detach().cpu())
+            val_seq.append(value.squeeze(0).detach().cpu())
+            rew_seq.append(float(reward))
+            term_seq.append(bool(terminated))
+            trunc_seq.append(bool(truncated))
+            final_val_seq.append(final_val)
+            active_mask_count += float(np.sum(obs["privileged_aux_mask"]))
+
+            if terminated or truncated:
+                obs, _ = env.reset(seed=ppo_cfg.seed + step_idx + 1)
+            else:
+                obs = next_obs
+
+            if len(obs_seq) >= target_batch and active_mask_count > 0.0:
+                break
+
+        with torch.no_grad():
+            tail_obs_t = {
+                k: torch.as_tensor(v, device=device).unsqueeze(0)
+                for k, v in obs.items()
+            }
+            next_value = agent.get_value(tail_obs_t).cpu()
+
+    rewards_t = torch.tensor(rew_seq, dtype=torch.float32).unsqueeze(1)
+    values_t = torch.stack(val_seq, dim=0).unsqueeze(1)
+    term_t = torch.tensor(term_seq, dtype=torch.bool).unsqueeze(1)
+    trunc_t = torch.tensor(trunc_seq, dtype=torch.bool).unsqueeze(1)
+    final_vals_t = torch.tensor(final_val_seq, dtype=torch.float32).unsqueeze(1)
+    adv_t, ret_t = compute_gae(
+        rewards=rewards_t,
+        values=values_t,
+        terminated=term_t,
+        truncated=trunc_t,
+        next_value=next_value,
+        final_values=final_vals_t,
+        gamma=ppo_cfg.gamma,
+        gae_lambda=ppo_cfg.gae_lambda,
+    )
+    adv_flat = adv_t.squeeze(1)
+    ret_flat = ret_t.squeeze(1)
+    if adv_flat.numel() > 1:
+        adv_flat = (adv_flat - adv_flat.mean()) / (adv_flat.std() + 1e-8)
+
+    # Prefer transitions with active aux mask if available, up to target_batch.
+    n_collected = len(obs_seq)
+    mask_sums = [float(np.sum(o["privileged_aux_mask"])) for o in obs_seq]
+    active_indices = [i for i, m in enumerate(mask_sums) if m > 0.0]
+    inactive_indices = [i for i, m in enumerate(mask_sums) if m <= 0.0]
+    chosen_indices = (active_indices + inactive_indices)[: min(target_batch, n_collected)]
+    _ = rng  # keep deterministic seed setup consistent
+
+    frozen_obs: dict[str, Tensor] = {
+        k: torch.stack([torch.as_tensor(obs_seq[i][k]) for i in chosen_indices], dim=0).to(device)
+        for k in (
+            *ACTOR_OBS_KEYS,
+            "privileged_state",
+            "privileged_aux_targets",
+            "privileged_aux_mask",
+        )
+    }
+    frozen_act = torch.stack([act_seq[i] for i in chosen_indices], dim=0).to(device)
+    frozen_logp = torch.stack([logp_seq[i] for i in chosen_indices], dim=0).to(device)
+    frozen_adv = adv_flat[chosen_indices].to(device)
+    frozen_ret = ret_flat[chosen_indices].to(device)
+
+    aux_mask_active = float(frozen_obs["privileged_aux_mask"].sum().cpu().item())
+    effective_steps = max(steps, 300 if ppo_cfg.lr < 1e-4 else steps)
+
+    nan_inf_detected = False
+    failure_reasons: list[str] = []
+    initial_losses: dict[str, float] = {}
+    final_losses: dict[str, float] = {}
+    grad_norms: list[float] = []
+    max_abs_param = 0.0
+    actor_std_min = float("inf")
+    actor_std_max = 0.0
+    max_ratio = 0.0
+
+    if aux_mask_active <= 0.0:
+        failure_reasons.append("No active privileged_aux_mask elements in preflight batch")
+
+    agent.train()
+    try:
+        for step_idx in range(effective_steps):
+            dist, z_vis = agent.actor.forward_actor(frozen_obs)
+            newlogp = dist.log_prob(frozen_act).sum(dim=-1)
+            entropy = dist.entropy().sum(dim=-1)
+            newvalue = agent.get_value(frozen_obs)
+            aux_pred = agent.aux_head(z_vis)
+            ratio = (newlogp - frozen_logp).exp()
+
+            pg_loss1 = -frozen_adv * ratio
+            pg_loss2 = -frozen_adv * torch.clamp(
+                ratio, 1.0 - ppo_cfg.clip_coef, 1.0 + ppo_cfg.clip_coef
+            )
+            pg_loss = torch.max(pg_loss1, pg_loss2).mean()
+            v_loss = 0.5 * ((newvalue - frozen_ret) ** 2).mean()
+            ent_loss = entropy.mean()
+            aux_loss = masked_aux_loss(
+                aux_pred,
+                frozen_obs["privileged_aux_targets"].to(dtype=torch.float32),
+                frozen_obs["privileged_aux_mask"],
+            )
+            loss = (
+                pg_loss
+                + ppo_cfg.vf_coef * v_loss
+                - ppo_cfg.ent_coef * ent_loss
+                + ppo_cfg.aux_coef * aux_loss
+            )
+
+            _assert_finite_mapping(
+                f"preflight_ppo.step_{step_idx}",
+                {
+                    "newlogp": newlogp,
+                    "entropy": entropy,
+                    "newvalue": newvalue,
+                    "aux_pred": aux_pred,
+                    "ratio": ratio,
+                    "dist_mean": dist.mean,
+                    "dist_stddev": dist.stddev,
+                    "pg_loss": pg_loss,
+                    "value_loss": v_loss,
+                    "ent_loss": ent_loss,
+                    "aux_loss": aux_loss,
+                    "total_loss": loss,
+                },
+            )
+
+            loss_snapshot = {
+                "policy_loss": float(pg_loss.detach().cpu().item()),
+                "value_loss": float(v_loss.detach().cpu().item()),
+                "aux_loss": float(aux_loss.detach().cpu().item()),
+                "entropy": float(ent_loss.detach().cpu().item()),
+                "total_loss": float(loss.detach().cpu().item()),
+            }
+            if step_idx == 0:
+                initial_losses = loss_snapshot
+            final_losses = loss_snapshot
+
+            actor_std_min = min(actor_std_min, float(dist.stddev.detach().min().cpu().item()))
+            actor_std_max = max(actor_std_max, float(dist.stddev.detach().max().cpu().item()))
+            max_ratio = max(max_ratio, float(ratio.detach().abs().max().cpu().item()))
+
+            optimizer.zero_grad()
+            loss.backward()
+            grad_norm = nn.utils.clip_grad_norm_(agent.parameters(), ppo_cfg.max_grad_norm)
+            _assert_finite_tensor(f"preflight_ppo.step_{step_idx}.grad_norm", grad_norm)
+            raw_grad_norm, _ = _module_grad_and_param_stats(agent.parameters())
+            grad_norms.append(float(raw_grad_norm))
+            optimizer.step()
+            _, step_max_param = _module_grad_and_param_stats(agent.parameters())
+            max_abs_param = max(max_abs_param, step_max_param)
+    except FloatingPointError as exc:
+        nan_inf_detected = True
+        failure_reasons.append(str(exc))
+
+    max_grad_norm = max(grad_norms) if grad_norms else 0.0
+    min_grad_norm = min(grad_norms) if grad_norms else 0.0
+
+    aux_overfit_ok = (
+        bool(final_losses)
+        and bool(initial_losses)
+        and final_losses["aux_loss"] < 0.08
+        and final_losses["aux_loss"] < initial_losses["aux_loss"]
+    )
+    value_overfit_ok = (
+        bool(final_losses)
+        and bool(initial_losses)
+        and final_losses["value_loss"] < initial_losses["value_loss"]
+        and (
+            final_losses["value_loss"] < 0.08
+            or final_losses["value_loss"] <= 0.1 * initial_losses["value_loss"]
+        )
+    )
+    total_loss_ok = (
+        bool(final_losses)
+        and bool(initial_losses)
+        and final_losses["total_loss"] < initial_losses["total_loss"]
+    )
+    checks = {
+        "finite_ok": not nan_inf_detected,
+        "aux_mask_active_ok": aux_mask_active > 0.0,
+        "non_zero_grads_ok": max_grad_norm > 0.0,
+        "aux_overfit_ok": aux_overfit_ok,
+        "value_overfit_ok": value_overfit_ok,
+        "total_loss_ok": total_loss_ok,
+    }
+    for cname, ok in checks.items():
+        if not ok and not any(cname in r for r in failure_reasons):
+            if cname != "finite_ok" and cname != "aux_mask_active_ok":
+                failure_reasons.append(f"Preflight check failed: {cname}")
+
+    return {
+        "algo": "ppo",
+        "passed": all(checks.values()),
+        "device": str(device),
+        "batch_size": len(chosen_indices),
+        "steps": effective_steps,
+        "nan_inf_detected": nan_inf_detected,
+        "aux_mask_active_elements": aux_mask_active,
+        "initial_losses": initial_losses,
+        "final_losses": final_losses,
+        "numerical_stats": {
+            "min_grad_norm": min_grad_norm,
+            "max_grad_norm": max_grad_norm,
+            "max_abs_param": max_abs_param,
+            "actor_std_min": actor_std_min if math.isfinite(actor_std_min) else None,
+            "actor_std_max": actor_std_max,
+            "max_ratio": max_ratio,
+        },
+        "checks": checks,
+        "failure_reasons": failure_reasons,
+    }
+
+
 def train_ppo(
     ppo_cfg: PPOConfig,
     workspace_cfg: WorkspaceConfig | None = None,
@@ -517,9 +947,11 @@ def train_ppo(
 
     best_score: tuple[float, float, float] = (-1.0, -1.0, -float("inf"))
     best_eval: dict[str, Any] = {}
+    last_eval: dict[str, Any] = {}
     last_log: dict[str, Any] = {}
     global_step = 0
     start_update = 1
+    last_completed_update = 0
 
     if resume_from is not None:
         ckpt_path = Path(resume_from)
@@ -528,291 +960,416 @@ def train_ppo(
         ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
         agent.load_state_dict(ckpt["agent"])
         optimizer.load_state_dict(ckpt["optimizer"])
-        start_update = int(ckpt.get("update", 0)) + 1
+        last_completed_update = int(ckpt.get("update", 0))
+        start_update = last_completed_update + 1
         global_step = int(ckpt.get("global_step", 0))
+        prev_summary: dict[str, Any] = {}
+        summary_candidate = ckpt_path.parent / "summary.json"
+        if not summary_candidate.exists() and (out_dir / "summary.json").exists():
+            summary_candidate = out_dir / "summary.json"
+        if summary_candidate.exists():
+            prev_summary = json.loads(summary_candidate.read_text())
+        if "best_score" in ckpt and ckpt["best_score"] is not None:
+            best_score = tuple(float(x) for x in ckpt["best_score"])
+            best_eval = dict(ckpt.get("best_eval", {}))
+        elif prev_summary:
+            prev_be = prev_summary.get("best_eval") or {}
+            if prev_be:
+                best_eval = dict(prev_be)
+                best_score = (
+                    float(prev_be.get("legal_strike_rate", -1.0)),
+                    float(prev_be.get("mean_credited_pins", -1.0)),
+                    float(prev_be.get("mean_return", -float("inf"))),
+                )
+        if "last_eval" in ckpt and ckpt["last_eval"]:
+            last_eval = dict(ckpt["last_eval"])
+        elif prev_summary and prev_summary.get("final_eval"):
+            last_eval = dict(prev_summary["final_eval"])
+        elif best_eval:
+            last_eval = dict(best_eval)
+        if "last_log" in ckpt and ckpt["last_log"]:
+            last_log = dict(ckpt["last_log"])
+        elif prev_summary and prev_summary.get("last_metrics"):
+            last_log = dict(prev_summary["last_metrics"])
     elif metrics_path.exists():
         metrics_path.unlink()
 
-    with ExitStack() as stack:
-        writer = SummaryWriter(log_dir=str(out_dir / "tb"))
-        stack.callback(writer.close)
-        vec_env = stack.enter_context(
-            make_vec_env(
-                num_envs=ppo_cfg.num_envs,
-                cfg=wcfg,
-                dr_enabled=ppo_cfg.dr_enabled,
-                render_rgb=True,
-                frame_stack=ppo_cfg.frame_stack,
-                gamma=ppo_cfg.gamma,
-                base_seed=ppo_cfg.seed,
-            )
-        )
-        if abs(vec_env.scorer_gamma - ppo_cfg.gamma) > 1e-6:
-            raise ValueError(
-                f"Scorer gamma {vec_env.scorer_gamma} != PPO gamma {ppo_cfg.gamma}"
-            )
-
-        next_obs = vec_env.reset(seed=ppo_cfg.seed)
-        ep_outcomes: list[dict[str, Any]] = []
-        t_start = perf_counter()
-
-        for update in range(start_update, num_updates + 1):
-            if ppo_cfg.anneal_lr:
-                frac = 1.0 - (update - 1.0) / num_updates
-                optimizer.param_groups[0]["lr"] = frac * ppo_cfg.lr
-
-            agent.eval()
-            for step in range(ppo_cfg.rollout_steps):
-                global_step += ppo_cfg.num_envs
-                pad = ppo_cfg.drq_pad_px
-                if pad > 0:
-                    w_shift = torch.from_numpy(
-                        rng.integers(-pad, pad + 1, size=(ppo_cfg.num_envs, 2), dtype=np.int64)
-                    )
-                    t_shift = torch.from_numpy(
-                        rng.integers(-pad, pad + 1, size=(ppo_cfg.num_envs, 2), dtype=np.int64)
-                    )
-                else:
-                    w_shift = torch.zeros((ppo_cfg.num_envs, 2), dtype=torch.long)
-                    t_shift = torch.zeros((ppo_cfg.num_envs, 2), dtype=torch.long)
-
-                with torch.no_grad():
-                    obs_t = _obs_to_device(next_obs, device)
-                    action, logprob, _, value, _ = agent.get_action_and_value(
-                        obs_t,
-                        wrist_shifts=w_shift.to(device),
-                        tripod_shifts=t_shift.to(device),
-                    )
-
-                clipped_action = np.clip(action.cpu().numpy(), -1.0, 1.0)
-                new_obs, rewards, terminated, truncated, infos = vec_env.step(clipped_action)
-
-                final_values = torch.zeros(ppo_cfg.num_envs, dtype=torch.float32)
-                for idx, info in enumerate(infos):
-                    if "outcome" in info:
-                        ep_outcomes.append(info["outcome"])
-                    if truncated[idx] and not terminated[idx] and "final_obs" in info:
-                        with torch.no_grad():
-                            f_obs_t = {
-                                k: torch.as_tensor(v, device=device).unsqueeze(0)
-                                for k, v in info["final_obs"].items()
-                            }
-                            final_values[idx] = agent.get_value(f_obs_t).squeeze(0).cpu()
-
-                buffer.insert(
-                    step=step,
-                    obs=next_obs,
-                    action=action,
-                    logprob=logprob,
-                    value=value,
-                    reward=rewards,
-                    terminated=terminated,
-                    truncated=truncated,
-                    final_value=final_values,
-                    wrist_shift=w_shift,
-                    tripod_shift=t_shift,
-                )
-                next_obs = new_obs
-
-            with torch.no_grad():
-                next_value = agent.get_value(_obs_to_device(next_obs, device)).cpu()
-            advantages, returns = compute_gae(
-                rewards=buffer.rewards,
-                values=buffer.values,
-                terminated=buffer.terminated,
-                truncated=buffer.truncated,
-                next_value=next_value,
-                final_values=buffer.final_values,
-                gamma=ppo_cfg.gamma,
-                gae_lambda=ppo_cfg.gae_lambda,
-            )
-
-            flat = buffer.flat_view(advantages, returns)
-            adv = flat["advantages"]
-            if adv.numel() > 1:
-                flat["advantages"] = (adv - adv.mean()) / (adv.std() + 1e-8)
-
-            agent.train()
-            clipfracs: list[float] = []
-            pg_losses: list[float] = []
-            v_losses: list[float] = []
-            ent_losses: list[float] = []
-            aux_losses: list[float] = []
-            pre_kls: list[float] = []
-
-            stop_early = False
-            for _ in range(ppo_cfg.num_epochs):
-                perm = rng.permutation(batch_size)
-                for start in range(0, batch_size, minibatch_size):
-                    mb_inds = perm[start : start + minibatch_size]
-                    (
-                        mb_obs,
-                        mb_act,
-                        mb_logp,
-                        mb_adv,
-                        mb_ret,
-                        _,
-                        mb_w_shift,
-                        mb_t_shift,
-                    ) = _batch_slice(flat, mb_inds, device)
-
-                    _, newlogp, entropy, newvalue, aux_pred = agent.get_action_and_value(
-                        mb_obs,
-                        wrist_shifts=mb_w_shift,
-                        tripod_shifts=mb_t_shift,
-                        action=mb_act,
-                    )
-                    logratio = newlogp - mb_logp
-                    ratio = logratio.exp()
-
-                    with torch.no_grad():
-                        approx_kl = float(((ratio - 1.0) - logratio).mean().cpu())
-                        pre_kls.append(approx_kl)
-                        clipfracs.append(float(((ratio - 1.0).abs() > ppo_cfg.clip_coef).float().mean().cpu()))
-
-                    pg_loss1 = -mb_adv * ratio
-                    pg_loss2 = -mb_adv * torch.clamp(
-                        ratio, 1.0 - ppo_cfg.clip_coef, 1.0 + ppo_cfg.clip_coef
-                    )
-                    pg_loss = torch.max(pg_loss1, pg_loss2).mean()
-                    v_loss = 0.5 * ((newvalue - mb_ret) ** 2).mean()
-                    ent_loss = entropy.mean()
-                    aux_loss = masked_aux_loss(
-                        aux_pred,
-                        mb_obs["privileged_aux_targets"].to(dtype=torch.float32),
-                        mb_obs["privileged_aux_mask"],
-                    )
-
-                    loss = (
-                        pg_loss
-                        + ppo_cfg.vf_coef * v_loss
-                        - ppo_cfg.ent_coef * ent_loss
-                        + ppo_cfg.aux_coef * aux_loss
-                    )
-
-                    optimizer.zero_grad()
-                    loss.backward()
-                    nn.utils.clip_grad_norm_(agent.parameters(), ppo_cfg.max_grad_norm)
-                    optimizer.step()
-
-                    pg_losses.append(float(pg_loss.detach().cpu()))
-                    v_losses.append(float(v_loss.detach().cpu()))
-                    ent_losses.append(float(ent_loss.detach().cpu()))
-                    aux_losses.append(float(aux_loss.detach().cpu()))
-
-                    if ppo_cfg.target_kl is not None and approx_kl > 1.5 * ppo_cfg.target_kl:
-                        stop_early = True
-                        break
-                if stop_early:
-                    break
-
-            # Measure post-update KL across rollout batch (captures policy drift from aux loss too).
-            post_kl_sum = 0.0
-            with torch.no_grad():
-                for start in range(0, batch_size, minibatch_size):
-                    mb_inds = slice(start, min(start + minibatch_size, batch_size))
-                    mb_obs, mb_act, mb_logp, _, _, _, mb_w_shift, mb_t_shift = _batch_slice(
-                        flat, mb_inds, device
-                    )
-                    _, post_logp, _, _, _ = agent.get_action_and_value(
-                        mb_obs,
-                        wrist_shifts=mb_w_shift,
-                        tripod_shifts=mb_t_shift,
-                        action=mb_act,
-                    )
-                    lr_diff = post_logp - mb_logp
-                    post_kl_sum += float(((lr_diff.exp() - 1.0) - lr_diff).sum().cpu())
-            post_update_kl = post_kl_sum / max(1, batch_size)
-
-            elapsed = max(1e-6, perf_counter() - t_start)
-            tps = global_step / elapsed
-            recent = ep_outcomes[-50:]
-            log_row: dict[str, Any] = {
-                "update": update,
+    def _save_latest_ckpt(update_idx: int) -> None:
+        torch.save(
+            {
+                "agent": agent.state_dict(),
+                "optimizer": optimizer.state_dict(),
+                "update": update_idx,
                 "global_step": global_step,
-                "lr": float(optimizer.param_groups[0]["lr"]),
-                "policy_loss": float(np.mean(pg_losses)),
-                "value_loss": float(np.mean(v_losses)),
-                "aux_loss": float(np.mean(aux_losses)),
-                "entropy": float(np.mean(ent_losses)),
-                "approx_kl": float(np.mean(pre_kls)),
-                "post_update_kl": post_update_kl,
-                "clipfrac": float(np.mean(clipfracs)),
-                "explained_variance": _explained_variance(flat["values"], flat["returns"]),
-                "transitions_per_sec": tps,
-                "rollout_episodes": len(ep_outcomes),
-                "train_legal_strike_rate": (
-                    float(np.mean([int(bool(o.get("legal_strike", False))) for o in recent]))
-                    if recent
-                    else 0.0
-                ),
-                "train_mean_credited_pins": (
-                    float(np.mean([int(o.get("credited_pins", 0)) for o in recent]))
-                    if recent
-                    else 0.0
-                ),
-                "train_illegal_rate": (
-                    float(np.mean([int(not bool(o.get("legal_delivery", False))) for o in recent]))
-                    if recent
-                    else 0.0
-                ),
-            }
+                "best_score": list(best_score),
+                "best_eval": best_eval,
+                "last_eval": last_eval,
+                "last_log": last_log,
+                "ppo_cfg": asdict(ppo_cfg),
+            },
+            out_dir / "latest.pt",
+        )
 
-            if (
-                update % ppo_cfg.checkpoint_interval_updates == 0
-                or update == num_updates
-            ):
-                torch.save(
-                    {
-                        "agent": agent.state_dict(),
-                        "optimizer": optimizer.state_dict(),
-                        "update": update,
-                        "global_step": global_step,
-                        "ppo_cfg": asdict(ppo_cfg),
-                    },
-                    out_dir / "latest.pt",
-                )
-
-            if update % ppo_cfg.eval_interval_updates == 0 or update == num_updates:
-                vid_path = (
-                    out_dir / "videos" / f"eval_step_{global_step:07d}.mp4"
-                    if ppo_cfg.save_video
-                    else None
-                )
-                ev = evaluate_actor(
-                    actor=agent.actor,
+    try:
+        with ExitStack() as stack:
+            writer = SummaryWriter(log_dir=str(out_dir / "tb"))
+            stack.callback(writer.close)
+            vec_env = stack.enter_context(
+                make_vec_env(
+                    num_envs=ppo_cfg.num_envs,
                     cfg=wcfg,
                     dr_enabled=ppo_cfg.dr_enabled,
+                    render_rgb=True,
                     frame_stack=ppo_cfg.frame_stack,
                     gamma=ppo_cfg.gamma,
-                    episodes=ppo_cfg.eval_episodes,
-                    seed=ppo_cfg.seed + 10000,
-                    device=device,
-                    video_path=vid_path,
+                    base_seed=ppo_cfg.seed,
                 )
-                log_row.update({f"eval_{k}": v for k, v in ev.items() if k != "episodes"})
-                score = (ev["legal_strike_rate"], ev["mean_credited_pins"], ev["mean_return"])
-                if score > best_score or not (out_dir / "best_actor.pt").exists():
-                    best_score = score
-                    best_eval = ev
-                    agent.actor.save_actor(out_dir / "best_actor.pt")
+            )
+            if abs(vec_env.scorer_gamma - ppo_cfg.gamma) > 1e-6:
+                raise ValueError(
+                    f"Scorer gamma {vec_env.scorer_gamma} != PPO gamma {ppo_cfg.gamma}"
+                )
 
-            for key, val in log_row.items():
-                if isinstance(val, (int, float)) and key not in ("update", "global_step"):
-                    writer.add_scalar(f"ppo/{key}", val, global_step)
-            with metrics_path.open("a") as f:
-                f.write(json.dumps(log_row) + "\n")
-            last_log = log_row
+            next_obs = vec_env.reset(seed=ppo_cfg.seed)
+            ep_outcomes: list[dict[str, Any]] = []
+            t_start = perf_counter()
 
+            for update in range(start_update, num_updates + 1):
+                if ppo_cfg.anneal_lr:
+                    frac = 1.0 - (update - 1.0) / num_updates
+                    optimizer.param_groups[0]["lr"] = frac * ppo_cfg.lr
+
+                agent.eval()
+                for step in range(ppo_cfg.rollout_steps):
+                    global_step += ppo_cfg.num_envs
+                    pad = ppo_cfg.drq_pad_px
+                    if pad > 0:
+                        w_shift = torch.from_numpy(
+                            rng.integers(-pad, pad + 1, size=(ppo_cfg.num_envs, 2), dtype=np.int64)
+                        )
+                        t_shift = torch.from_numpy(
+                            rng.integers(-pad, pad + 1, size=(ppo_cfg.num_envs, 2), dtype=np.int64)
+                        )
+                    else:
+                        w_shift = torch.zeros((ppo_cfg.num_envs, 2), dtype=torch.long)
+                        t_shift = torch.zeros((ppo_cfg.num_envs, 2), dtype=torch.long)
+
+                    with torch.no_grad():
+                        obs_t = _obs_to_device(next_obs, device)
+                        action, logprob, _, value, _ = agent.get_action_and_value(
+                            obs_t,
+                            wrist_shifts=w_shift.to(device),
+                            tripod_shifts=t_shift.to(device),
+                        )
+
+                    _assert_finite_mapping(
+                        f"ppo.rollout.step_{global_step}",
+                        {"action": action, "logprob": logprob, "value": value},
+                    )
+                    clipped_action = np.clip(action.cpu().numpy(), -1.0, 1.0)
+                    new_obs, rewards, terminated, truncated, infos = vec_env.step(clipped_action)
+                    _assert_finite_tensor(
+                        f"ppo.rollout.step_{global_step}.rewards", torch.as_tensor(rewards)
+                    )
+
+                    final_values = torch.zeros(ppo_cfg.num_envs, dtype=torch.float32)
+                    for idx, info in enumerate(infos):
+                        if "outcome" in info:
+                            ep_outcomes.append(info["outcome"])
+                        if truncated[idx] and not terminated[idx] and "final_obs" in info:
+                            with torch.no_grad():
+                                f_obs_t = {
+                                    k: torch.as_tensor(v, device=device).unsqueeze(0)
+                                    for k, v in info["final_obs"].items()
+                                }
+                                final_values[idx] = agent.get_value(f_obs_t).squeeze(0).cpu()
+                    _assert_finite_tensor(
+                        f"ppo.rollout.step_{global_step}.final_values", final_values
+                    )
+
+                    buffer.insert(
+                        step=step,
+                        obs=next_obs,
+                        action=action,
+                        logprob=logprob,
+                        value=value,
+                        reward=rewards,
+                        terminated=terminated,
+                        truncated=truncated,
+                        final_value=final_values,
+                        wrist_shift=w_shift,
+                        tripod_shift=t_shift,
+                    )
+                    next_obs = new_obs
+
+                with torch.no_grad():
+                    next_value = agent.get_value(_obs_to_device(next_obs, device)).cpu()
+                _assert_finite_tensor("ppo.rollout.next_value", next_value)
+                advantages, returns = compute_gae(
+                    rewards=buffer.rewards,
+                    values=buffer.values,
+                    terminated=buffer.terminated,
+                    truncated=buffer.truncated,
+                    next_value=next_value,
+                    final_values=buffer.final_values,
+                    gamma=ppo_cfg.gamma,
+                    gae_lambda=ppo_cfg.gae_lambda,
+                )
+
+                flat = buffer.flat_view(advantages, returns)
+                adv = flat["advantages"]
+                if adv.numel() > 1:
+                    flat["advantages"] = (adv - adv.mean()) / (adv.std() + 1e-8)
+
+                agent.train()
+                clipfracs: list[float] = []
+                pg_losses: list[float] = []
+                v_losses: list[float] = []
+                ent_losses: list[float] = []
+                aux_losses: list[float] = []
+                pre_kls: list[float] = []
+
+                stop_early = False
+                for _ in range(ppo_cfg.num_epochs):
+                    perm = rng.permutation(batch_size)
+                    for start in range(0, batch_size, minibatch_size):
+                        mb_inds = perm[start : start + minibatch_size]
+                        (
+                            mb_obs,
+                            mb_act,
+                            mb_logp,
+                            mb_adv,
+                            mb_ret,
+                            _,
+                            mb_w_shift,
+                            mb_t_shift,
+                        ) = _batch_slice(flat, mb_inds, device)
+
+                        _, newlogp, entropy, newvalue, aux_pred = agent.get_action_and_value(
+                            mb_obs,
+                            wrist_shifts=mb_w_shift,
+                            tripod_shifts=mb_t_shift,
+                            action=mb_act,
+                        )
+                        logratio = newlogp - mb_logp
+                        ratio = logratio.exp()
+
+                        with torch.no_grad():
+                            approx_kl = float(((ratio - 1.0) - logratio).mean().cpu())
+                            pre_kls.append(approx_kl)
+                            clipfracs.append(
+                                float(((ratio - 1.0).abs() > ppo_cfg.clip_coef).float().mean().cpu())
+                            )
+
+                        pg_loss1 = -mb_adv * ratio
+                        pg_loss2 = -mb_adv * torch.clamp(
+                            ratio, 1.0 - ppo_cfg.clip_coef, 1.0 + ppo_cfg.clip_coef
+                        )
+                        pg_loss = torch.max(pg_loss1, pg_loss2).mean()
+                        v_loss = 0.5 * ((newvalue - mb_ret) ** 2).mean()
+                        ent_loss = entropy.mean()
+                        aux_loss = masked_aux_loss(
+                            aux_pred,
+                            mb_obs["privileged_aux_targets"].to(dtype=torch.float32),
+                            mb_obs["privileged_aux_mask"],
+                        )
+
+                        loss = (
+                            pg_loss
+                            + ppo_cfg.vf_coef * v_loss
+                            - ppo_cfg.ent_coef * ent_loss
+                            + ppo_cfg.aux_coef * aux_loss
+                        )
+                        _assert_finite_mapping(
+                            f"ppo.update_{update}",
+                            {
+                                "newlogp": newlogp,
+                                "entropy": entropy,
+                                "newvalue": newvalue,
+                                "aux_pred": aux_pred,
+                                "ratio": ratio,
+                                "pg_loss": pg_loss,
+                                "value_loss": v_loss,
+                                "ent_loss": ent_loss,
+                                "aux_loss": aux_loss,
+                                "loss": loss,
+                            },
+                        )
+
+                        optimizer.zero_grad()
+                        loss.backward()
+                        grad_norm = nn.utils.clip_grad_norm_(agent.parameters(), ppo_cfg.max_grad_norm)
+                        _assert_finite_tensor(f"ppo.update_{update}.grad_norm", grad_norm)
+                        _module_grad_and_param_stats(agent.parameters())
+                        optimizer.step()
+                        _module_grad_and_param_stats(agent.parameters())
+
+                        pg_losses.append(float(pg_loss.detach().cpu()))
+                        v_losses.append(float(v_loss.detach().cpu()))
+                        ent_losses.append(float(ent_loss.detach().cpu()))
+                        aux_losses.append(float(aux_loss.detach().cpu()))
+
+                        if ppo_cfg.target_kl is not None and approx_kl > 1.5 * ppo_cfg.target_kl:
+                            stop_early = True
+                            break
+                    if stop_early:
+                        break
+
+                # Measure post-update KL across rollout batch (captures policy drift from aux loss too).
+                post_kl_sum = 0.0
+                with torch.no_grad():
+                    for start in range(0, batch_size, minibatch_size):
+                        mb_inds = slice(start, min(start + minibatch_size, batch_size))
+                        mb_obs, mb_act, mb_logp, _, _, _, mb_w_shift, mb_t_shift = _batch_slice(
+                            flat, mb_inds, device
+                        )
+                        _, post_logp, _, _, _ = agent.get_action_and_value(
+                            mb_obs,
+                            wrist_shifts=mb_w_shift,
+                            tripod_shifts=mb_t_shift,
+                            action=mb_act,
+                        )
+                        lr_diff = post_logp - mb_logp
+                        post_kl_sum += float(((lr_diff.exp() - 1.0) - lr_diff).sum().cpu())
+                post_update_kl = post_kl_sum / max(1, batch_size)
+
+                elapsed = max(1e-6, perf_counter() - t_start)
+                tps = global_step / elapsed
+                recent = ep_outcomes[-50:]
+                log_row: dict[str, Any] = {
+                    "update": update,
+                    "global_step": global_step,
+                    "lr": float(optimizer.param_groups[0]["lr"]),
+                    "policy_loss": float(np.mean(pg_losses)),
+                    "value_loss": float(np.mean(v_losses)),
+                    "aux_loss": float(np.mean(aux_losses)),
+                    "entropy": float(np.mean(ent_losses)),
+                    "approx_kl": float(np.mean(pre_kls)),
+                    "post_update_kl": post_update_kl,
+                    "clipfrac": float(np.mean(clipfracs)),
+                    "explained_variance": _explained_variance(flat["values"], flat["returns"]),
+                    "transitions_per_sec": tps,
+                    "rollout_episodes": len(ep_outcomes),
+                    "train_legal_strike_rate": (
+                        float(np.mean([int(bool(o.get("legal_strike", False))) for o in recent]))
+                        if recent
+                        else 0.0
+                    ),
+                    "train_mean_credited_pins": (
+                        float(np.mean([int(o.get("credited_pins", 0)) for o in recent]))
+                        if recent
+                        else 0.0
+                    ),
+                    "train_illegal_rate": (
+                        float(np.mean([int(not bool(o.get("legal_delivery", False))) for o in recent]))
+                        if recent
+                        else 0.0
+                    ),
+                }
+
+                if update % ppo_cfg.eval_interval_updates == 0 or update == num_updates:
+                    vid_path = (
+                        out_dir / "videos" / f"eval_step_{global_step:07d}.mp4"
+                        if ppo_cfg.save_video
+                        else None
+                    )
+                    ev = evaluate_actor(
+                        actor=agent.actor,
+                        cfg=wcfg,
+                        dr_enabled=ppo_cfg.dr_enabled,
+                        frame_stack=ppo_cfg.frame_stack,
+                        gamma=ppo_cfg.gamma,
+                        episodes=ppo_cfg.eval_episodes,
+                        seed=ppo_cfg.seed + 10000,
+                        device=device,
+                        video_path=vid_path,
+                        aux_head=agent.aux_head,
+                    )
+                    last_eval = ev
+                    log_row.update(
+                        {
+                            (k if k.startswith("eval_") else f"eval_{k}"): v
+                            for k, v in ev.items()
+                            if k != "episodes"
+                        }
+                    )
+                    score = (ev["legal_strike_rate"], ev["mean_credited_pins"], ev["mean_return"])
+                    if score > best_score or not (out_dir / "best_actor.pt").exists():
+                        best_score = score
+                        best_eval = ev
+                        agent.actor.save_actor(out_dir / "best_actor.pt")
+                    print(
+                        f"[ppo] eval step={global_step}/{ppo_cfg.total_timesteps} "
+                        f"strike={ev['legal_strike_rate']:.3f} pins={ev['mean_credited_pins']:.3f} "
+                        f"steps={ev['mean_episode_steps']:.1f} return={ev['mean_return']:.3f} "
+                        f"eval_aux={ev.get('eval_aux_loss')}",
+                        flush=True,
+                    )
+
+                for key, val in log_row.items():
+                    if (
+                        isinstance(val, (int, float))
+                        and not isinstance(val, bool)
+                        and key not in ("update", "global_step")
+                    ):
+                        writer.add_scalar(f"ppo/{key}", val, global_step)
+                with metrics_path.open("a") as f:
+                    f.write(json.dumps(log_row) + "\n")
+                last_log = log_row
+                last_completed_update = update
+
+                if (
+                    update % ppo_cfg.checkpoint_interval_updates == 0
+                    or update == num_updates
+                ):
+                    _save_latest_ckpt(update)
+
+                print(
+                    f"[ppo] upd={update}/{num_updates} step={global_step} "
+                    f"pg={log_row['policy_loss']:.4f} vf={log_row['value_loss']:.4f} "
+                    f"aux={log_row['aux_loss']:.4f} kl={log_row['post_update_kl']:.4f} "
+                    f"tps={tps:.1f}",
+                    flush=True,
+                )
+
+            agent.actor.save_actor(out_dir / "final_actor.pt")
+            if not (out_dir / "best_actor.pt").exists():
+                agent.actor.save_actor(out_dir / "best_actor.pt")
+    except FloatingPointError as exc:
+        _write_ppo_summary(
+            out_dir,
+            global_step=global_step,
+            total_timesteps=ppo_cfg.total_timesteps,
+            best_eval=best_eval,
+            last_eval=last_eval,
+            last_log=last_log,
+            nan_inf_detected=True,
+            nan_inf_error=str(exc),
+        )
+        raise
+    except KeyboardInterrupt:
+        _save_latest_ckpt(last_completed_update)
         agent.actor.save_actor(out_dir / "final_actor.pt")
         if not (out_dir / "best_actor.pt").exists():
             agent.actor.save_actor(out_dir / "best_actor.pt")
+        _write_ppo_summary(
+            out_dir,
+            global_step=global_step,
+            total_timesteps=ppo_cfg.total_timesteps,
+            best_eval=best_eval,
+            last_eval=last_eval,
+            last_log=last_log,
+            nan_inf_detected=False,
+            interrupted=True,
+        )
+        raise
 
-    summary = {
-        "run_dir": str(out_dir),
-        "global_step": global_step,
-        "best_eval": best_eval,
-        "last_metrics": last_log,
-    }
-    (out_dir / "summary.json").write_text(json.dumps(summary, indent=2))
-    return summary
+    return _write_ppo_summary(
+        out_dir,
+        global_step=global_step,
+        total_timesteps=ppo_cfg.total_timesteps,
+        best_eval=best_eval,
+        last_eval=last_eval,
+        last_log=last_log,
+        nan_inf_detected=False,
+    )

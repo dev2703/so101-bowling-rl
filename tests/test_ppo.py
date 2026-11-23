@@ -410,3 +410,100 @@ def test_train_ppo_closes_writer_if_vec_env_startup_fails(
     with pytest.raises(EOFError, match="startup failed"):
         train_ppo(cfg, run_dir=tmp_path)
     writer.close.assert_called_once_with()
+
+
+def test_preflight_ppo_passes_and_detects_nan_or_zero_aux(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from so101_bowling.ppo import preflight_ppo
+
+    cfg = PPOConfig(
+        num_envs=1,
+        rollout_steps=8,
+        minibatch_size=4,
+        lr=1.0e-3,
+        aux_coef=1.0,
+        device="cpu",
+    )
+    report = preflight_ppo(cfg, workspace_cfg=load_config(), steps=100, batch_size=4)
+    assert report["algo"] == "ppo"
+    assert report["passed"] is True
+    assert report["nan_inf_detected"] is False
+    assert report["aux_mask_active_elements"] > 0.0
+    assert report["final_losses"]["aux_loss"] < 0.08
+    assert report["final_losses"]["aux_loss"] < report["initial_losses"]["aux_loss"]
+
+    # Inject NaN into masked_aux_loss to verify preflight catches NaN/Inf cleanly.
+    monkeypatch.setattr(
+        ppo,
+        "masked_aux_loss",
+        lambda pred, tgt, mask: pred.sum() * 0.0 + float("nan"),
+    )
+    nan_report = preflight_ppo(cfg, workspace_cfg=load_config(), steps=10, batch_size=4)
+    assert nan_report["passed"] is False
+    assert nan_report["nan_inf_detected"] is True
+    assert nan_report["checks"]["finite_ok"] is False
+
+
+def test_evaluate_actor_steps_eval_aux_and_eval_ppo_cli(tmp_path: Path) -> None:
+    import json
+
+    wcfg = load_config()
+    agent = AsymmetricPPOAgent(frame_stack=2, encoder_type="spatial_grid")
+    ev = evaluate_actor(
+        actor=agent.actor,
+        cfg=wcfg,
+        dr_enabled=False,
+        frame_stack=2,
+        episodes=1,
+        seed=42,
+        device="cpu",
+        aux_head=agent.aux_head,
+    )
+    assert ev["mean_episode_steps"] > 0.0
+    assert ev["eval_aux_loss"] is not None
+    assert np.isfinite(ev["eval_aux_loss"])
+
+    ppo_cfg = PPOConfig(
+        num_envs=1,
+        rollout_steps=4,
+        total_timesteps=4,
+        minibatch_size=4,
+        eval_interval_updates=1,
+        checkpoint_interval_updates=1,
+        eval_episodes=1,
+        save_video=False,
+        device="cpu",
+    )
+    run_dir = tmp_path / "ppo_eval_cli"
+    summary = train_ppo(ppo_cfg=ppo_cfg, workspace_cfg=wcfg, run_dir=run_dir)
+    assert summary["nan_inf_detected"] is False
+    assert "validation_loss_note" in summary
+    assert "final_losses" in summary
+    assert summary["eval_aux_loss"] is not None
+    assert summary["final_eval"]["mean_episode_steps"] > 0.0
+    metrics_row = json.loads((run_dir / "metrics.jsonl").read_text().strip().splitlines()[-1])
+    assert "eval_aux_loss" in metrics_row
+    assert "eval_eval_aux_loss" not in metrics_row
+
+    repo_root = Path(__file__).resolve().parents[1]
+    proc = subprocess.run(
+        [
+            sys.executable,
+            str(repo_root / "scripts" / "eval_ppo.py"),
+            "--run-dir",
+            str(run_dir),
+            "--episodes",
+            "1",
+            "--device",
+            "cpu",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    eval_out = json.loads(proc.stdout)
+    assert eval_out["mean_episode_steps"] > 0.0
+    assert "training_metrics" in eval_out
+    assert eval_out["training_metrics"]["nan_inf_detected"] is False
+    assert "final_losses" in eval_out["training_metrics"]

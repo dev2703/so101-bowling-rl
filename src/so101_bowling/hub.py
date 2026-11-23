@@ -58,11 +58,49 @@ def build_model_card(
                 f"| Mean Credited Pins | `{best_eval.get('mean_credited_pins', 0.0):.3f}` |",
                 f"| Illegal Rate | `{best_eval.get('illegal_rate', 0.0):.3f}` |",
                 f"| Mean Return | `{best_eval.get('mean_return', 0.0):.3f}` |",
+                f"| Mean Episode Steps | `{best_eval.get('mean_episode_steps', 0.0):.2f}` |",
                 "",
             ]
         )
     else:
         lines.append("No evaluation summary found in run directory.\n")
+
+    if summary and any(
+        k in summary
+        for k in (
+            "eval_aux_loss",
+            "final_losses",
+            "nan_inf_detected",
+            "validation_loss_note",
+            "global_step",
+        )
+    ):
+        eval_aux = summary.get("eval_aux_loss")
+        eval_aux_str = (
+            f"{eval_aux:.6f}"
+            if isinstance(eval_aux, (int, float)) and not isinstance(eval_aux, bool)
+            else "N/A"
+        )
+        lines.extend(
+            [
+                "## Training & Validation Metrics",
+                "",
+                "| Field | Value |",
+                "| --- | --- |",
+                f"| Global Step | `{summary.get('global_step', 0)}` |",
+                f"| Total Timesteps | `{summary.get('total_timesteps', summary.get('global_step', 0))}` |",
+                f"| Eval Aux Loss | `{eval_aux_str}` |",
+                f"| NaN/Inf Detected | `{summary.get('nan_inf_detected', False)}` |",
+            ]
+        )
+        final_losses = summary.get("final_losses") or {}
+        for k, v in final_losses.items():
+            if isinstance(v, (int, float)) and not isinstance(v, bool):
+                lines.append(f"| Final `{k}` | `{v:.6f}` |")
+        lines.append("")
+        note = summary.get("validation_loss_note")
+        if note:
+            lines.extend([f"> {note}", ""])
 
     if config:
         lines.extend(
@@ -76,13 +114,15 @@ def build_model_card(
             ]
         )
 
+    default_filename = "actor_best.pt" if algo == "sac" else "best_actor.pt"
     lines.extend(
         [
             "## Usage",
             "",
             "```python",
             "from so101_bowling.hub import load_actor_from_hub",
-            f'actor = load_actor_from_hub("{repo_id}")',
+            f'actor = load_actor_from_hub("{repo_id}")  # auto-detects actor_best.pt (SAC) / best_actor.pt (PPO)',
+            f'# Or explicitly: load_actor_from_hub("{repo_id}", filename="{default_filename}")',
             "```",
             "",
         ]
@@ -173,6 +213,7 @@ def push_model_to_hub(
             "*actor*.pt",
             "*_config.json",
             "summary.json",
+            "preflight_report.json",
             "metrics.jsonl",
             "status.json",
             "videos/*.mp4",
@@ -219,7 +260,7 @@ def push_dataset_to_hub(
 
 def load_actor_from_hub(
     repo_id: str,
-    filename: str = "actor_best.pt",
+    filename: str | None = None,
     map_location: str = "cpu",
     revision: str | None = None,
     token: str | None = None,
@@ -235,11 +276,40 @@ def load_actor_from_hub(
             ) from exc
         downloader = hf_hub_download
 
-    local_path = downloader(
-        repo_id=repo_id,
-        filename=filename,
-        repo_type="model",
-        revision=revision,
-        token=token,
-    )
-    return load_actor(local_path, map_location=map_location)
+    if filename is not None:
+        local_path = downloader(
+            repo_id=repo_id,
+            filename=filename,
+            repo_type="model",
+            revision=revision,
+            token=token,
+        )
+        return load_actor(local_path, map_location=map_location)
+
+    try:
+        from huggingface_hub.errors import EntryNotFoundError
+    except ImportError:
+        try:
+            from huggingface_hub.utils import EntryNotFoundError
+        except ImportError:
+            EntryNotFoundError = FileNotFoundError  # type: ignore[misc,assignment]
+    missing_excs = (FileNotFoundError, EntryNotFoundError)
+
+    last_exc: Exception | None = None
+    for candidate in _ACTOR_CANDIDATES:
+        try:
+            local_path = downloader(
+                repo_id=repo_id,
+                filename=candidate,
+                repo_type="model",
+                revision=revision,
+                token=token,
+            )
+            return load_actor(local_path, map_location=map_location)
+        except missing_excs as exc:
+            last_exc = exc
+            continue
+
+    raise FileNotFoundError(
+        f"No actor checkpoint from {_ACTOR_CANDIDATES} found in {repo_id!r}"
+    ) from last_exc

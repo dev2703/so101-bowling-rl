@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import numpy as np
 import pytest
 import torch
@@ -86,3 +88,185 @@ def test_evaluate_actor_restores_training_mode_on_error(monkeypatch: pytest.Monk
     with pytest.raises(RuntimeError, match="boom"):
         evaluate_actor(actor=actor, cfg=load_config(), episodes=1, device="cpu")
     assert actor.training is True
+
+
+def test_runtime_nan_abort_ppo_and_sac(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import json
+    from so101_bowling import ppo as ppo_mod
+    from so101_bowling import sac as sac_mod
+    from so101_bowling.ppo import train_ppo
+    from so101_bowling.sac import SACConfig, train_sac
+
+    wcfg = load_config()
+
+    monkeypatch.setattr(
+        ppo_mod,
+        "masked_aux_loss",
+        lambda pred, tgt, mask: pred.sum() * 0.0 + float("nan"),
+    )
+    ppo_dir = tmp_path / "ppo_nan"
+    ppo_cfg = PPOConfig(
+        num_envs=1,
+        rollout_steps=4,
+        total_timesteps=4,
+        minibatch_size=4,
+        eval_episodes=1,
+        save_video=False,
+        device="cpu",
+    )
+    with pytest.raises(FloatingPointError, match="Non-finite"):
+        train_ppo(ppo_cfg=ppo_cfg, workspace_cfg=wcfg, run_dir=ppo_dir)
+    ppo_summary = json.loads((ppo_dir / "summary.json").read_text())
+    assert ppo_summary["nan_inf_detected"] is True
+    assert "Non-finite" in ppo_summary["nan_inf_error"]
+
+    monkeypatch.setattr(
+        sac_mod,
+        "masked_aux_loss",
+        lambda pred, tgt, mask: pred.sum() * 0.0 + float("inf"),
+    )
+    sac_dir = tmp_path / "sac_nan"
+    sac_cfg = SACConfig(
+        num_envs=1,
+        capacity=16,
+        batch_size=4,
+        learning_starts=0,
+        utd_ratio=1.0,
+        total_timesteps=4,
+        eval_interval_steps=4,
+        checkpoint_interval_steps=4,
+        eval_episodes=1,
+        save_video=False,
+        device="cpu",
+    )
+    with pytest.raises(FloatingPointError, match="Non-finite"):
+        train_sac(cfg=sac_cfg, workspace_cfg=wcfg, run_dir=sac_dir)
+    sac_summary = json.loads((sac_dir / "summary.json").read_text())
+    assert sac_summary["nan_inf_detected"] is True
+    assert "Non-finite" in sac_summary["nan_inf_error"]
+
+
+def test_actor_nan_inf_overflow_raises_floating_point_and_persists_status(
+    tmp_path: Path,
+) -> None:
+    import importlib.util
+    import json
+
+    # 1. Direct DualCameraActor overflow raises FloatingPointError (not ValueError from Normal).
+    actor = DualCameraActor(frame_stack=2)
+    with torch.no_grad():
+        actor.mean_head.weight.fill_(float("nan"))
+    obs = {
+        "wrist_rgb": torch.zeros((1, 2, 64, 112, 3), dtype=torch.uint8),
+        "tripod_rgb": torch.zeros((1, 2, 64, 112, 3), dtype=torch.uint8),
+        "camera_meta": torch.zeros((1, 4), dtype=torch.float32),
+        "proprio": torch.zeros((1, 12), dtype=torch.float32),
+    }
+    with pytest.raises(FloatingPointError, match="Non-finite actor distribution"):
+        actor.forward_actor(obs)
+
+    # 2. End-to-end colab_train.py with lr=1e35 / actor-lr=1e35 records nan_inf_detected=True.
+    repo_root = Path(__file__).resolve().parents[1]
+    spec = importlib.util.spec_from_file_location(
+        "colab_train_nan", repo_root / "scripts" / "colab_train.py"
+    )
+    assert spec is not None and spec.loader is not None
+    ct_mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ct_mod)
+
+    ppo_pf_dir = tmp_path / "pf_ppo_nan"
+    with pytest.raises(SystemExit) as exc_ppo:
+        ct_mod.main(
+            [
+                "--algo",
+                "ppo",
+                "--lr",
+                "1e35",
+                "--preflight",
+                "--preflight-steps",
+                "5",
+                "--preflight-batch-size",
+                "4",
+                "--device",
+                "cpu",
+                "--mujoco-gl",
+                "",
+                "--run-dir",
+                str(ppo_pf_dir),
+            ]
+        )
+    assert exc_ppo.value.code == 1
+    ppo_pf_report = json.loads((ppo_pf_dir / "preflight_report.json").read_text())
+    ppo_pf_status = json.loads((ppo_pf_dir / "status.json").read_text())
+    assert ppo_pf_report["passed"] is False
+    assert ppo_pf_report["nan_inf_detected"] is True
+    assert ppo_pf_report["checks"]["finite_ok"] is False
+    assert ppo_pf_status["state"] == "failed"
+    assert ppo_pf_status["nan_inf_detected"] is True
+
+    sac_pf_dir = tmp_path / "pf_sac_nan"
+    with pytest.raises(SystemExit) as exc_sac:
+        ct_mod.main(
+            [
+                "--algo",
+                "sac",
+                "--actor-lr",
+                "1e35",
+                "--preflight",
+                "--preflight-steps",
+                "5",
+                "--preflight-batch-size",
+                "4",
+                "--device",
+                "cpu",
+                "--mujoco-gl",
+                "",
+                "--run-dir",
+                str(sac_pf_dir),
+            ]
+        )
+    assert exc_sac.value.code == 1
+    sac_pf_report = json.loads((sac_pf_dir / "preflight_report.json").read_text())
+    sac_pf_status = json.loads((sac_pf_dir / "status.json").read_text())
+    assert sac_pf_report["passed"] is False
+    assert sac_pf_report["nan_inf_detected"] is True
+    assert sac_pf_report["checks"]["finite_ok"] is False
+    assert sac_pf_status["state"] == "failed"
+    assert sac_pf_status["nan_inf_detected"] is True
+
+    ppo_rt_dir = tmp_path / "rt_ppo_nan"
+    with pytest.raises(FloatingPointError, match="Non-finite"):
+        ct_mod.main(
+            [
+                "--algo",
+                "ppo",
+                "--lr",
+                "1e35",
+                "--num-envs",
+                "1",
+                "--rollout-steps",
+                "4",
+                "--minibatch-size",
+                "4",
+                "--total-timesteps",
+                "8",
+                "--eval-interval-updates",
+                "1",
+                "--eval-episodes",
+                "1",
+                "--no-save-video",
+                "--device",
+                "cpu",
+                "--mujoco-gl",
+                "",
+                "--run-dir",
+                str(ppo_rt_dir),
+            ]
+        )
+    ppo_rt_summary = json.loads((ppo_rt_dir / "summary.json").read_text())
+    ppo_rt_status = json.loads((ppo_rt_dir / "status.json").read_text())
+    assert ppo_rt_summary["nan_inf_detected"] is True
+    assert ppo_rt_status["state"] == "failed"
+    assert ppo_rt_status["nan_inf_detected"] is True

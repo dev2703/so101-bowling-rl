@@ -15,13 +15,13 @@ def main() -> None:
     m_parser = sub.add_parser("model", help="Push a trained actor run directory to HF Hub.")
     m_parser.add_argument("--run-dir", required=True, help="Local training run directory.")
     m_parser.add_argument("--repo-id", required=True, help="HF repo id, e.g. user/so101-bowling-sac.")
-    m_parser.add_argument("--private", action="store_true")
+    m_parser.add_argument("--private", action=argparse.BooleanOptionalAction, default=True)
     m_parser.add_argument("--message", default=None)
 
     d_parser = sub.add_parser("dataset", help="Push a collected bowling dataset to HF Hub.")
     d_parser.add_argument("--dataset-dir", required=True, help="Local dataset directory.")
     d_parser.add_argument("--repo-id", required=True, help="HF dataset repo id, e.g. user/so101-bowling-demos.")
-    d_parser.add_argument("--private", action="store_true")
+    d_parser.add_argument("--private", action=argparse.BooleanOptionalAction, default=True)
     d_parser.add_argument("--message", default=None)
 
     args = parser.parse_args()

@@ -117,9 +117,16 @@ class ScriptedPushController:
         self.phase = "lift"
         self._push_steps = 0
         self._hold_steps = 0
+        self._settle_steps = 0
+        self._step_idx = 0
+        self._est_lag: int | None = None
+        self._q0: np.ndarray | None = None
+        self._q_des: np.ndarray | None = None
         self.q_lift = np.zeros(len(ACTIVE_JOINTS), dtype=np.float64)
         self.q_stage = np.zeros(len(ACTIVE_JOINTS), dtype=np.float64)
         self.q_push_end = np.zeros(len(ACTIVE_JOINTS), dtype=np.float64)
+        self.q_push_mid = np.zeros(len(ACTIVE_JOINTS), dtype=np.float64)
+        self.q_push_end_safe = np.zeros(len(ACTIVE_JOINTS), dtype=np.float64)
         self.u_aim = np.array([1.0, 0.0], dtype=np.float64)
 
     def reset(self, ball_pos: np.ndarray, pin_positions: np.ndarray) -> None:
@@ -140,10 +147,22 @@ class ScriptedPushController:
 
         # Keep end waypoint strictly inside foul_line_x with safety margin for gripper geometry.
         max_end_x = float(self.cfg.delivery.foul_line_x) - 0.020
-        end_xy = ball_xy + float(self.params.follow_through_m) * u_aim
+        raw_end_xy = ball_xy + float(self.params.follow_through_m) * u_aim
+        end_xy = raw_end_xy.copy()
         if end_xy[0] > max_end_x and end_xy[0] > stage_xy[0] + 1e-6:
             t_clamp = (max_end_x - stage_xy[0]) / (end_xy[0] - stage_xy[0])
             end_xy = stage_xy + np.clip(t_clamp, 0.0, 1.0) * (end_xy - stage_xy)
+
+        safe_end_x = float(self.cfg.delivery.foul_line_x) - 0.032
+        end_xy_safe = raw_end_xy.copy()
+        if end_xy_safe[0] > safe_end_x and end_xy_safe[0] > stage_xy[0] + 1e-6:
+            t_clamp_safe = (safe_end_x - stage_xy[0]) / (end_xy_safe[0] - stage_xy[0])
+            end_xy_safe = stage_xy + np.clip(t_clamp_safe, 0.0, 1.0) * (end_xy_safe - stage_xy)
+
+        mid_xy = ball_xy + 0.055 * u_aim
+        if mid_xy[0] > safe_end_x and mid_xy[0] > stage_xy[0] + 1e-6:
+            t_clamp_mid = (safe_end_x - stage_xy[0]) / (mid_xy[0] - stage_xy[0])
+            mid_xy = stage_xy + np.clip(t_clamp_mid, 0.0, 1.0) * (mid_xy - stage_xy)
 
         min_clear_z = float(self.cfg.table.pad_thickness) + 0.044
         stage_z = max(float(self.params.push_height_z), min_clear_z)
@@ -153,6 +172,8 @@ class ScriptedPushController:
         p_lift = np.array([stage_xy[0], stage_xy[1], lift_z], dtype=np.float64)
         p_stage = np.array([stage_xy[0], stage_xy[1], stage_z], dtype=np.float64)
         p_end = np.array([end_xy[0], end_xy[1], end_z], dtype=np.float64)
+        p_mid = np.array([mid_xy[0], mid_xy[1], stage_z + 0.008], dtype=np.float64)
+        p_end_safe = np.array([end_xy_safe[0], end_xy_safe[1], stage_z + 0.018], dtype=np.float64)
 
         pan_seed = float(np.arctan2(stage_xy[1], stage_xy[0]))
         q_seed = np.array([pan_seed, -0.45, 0.75, 1.05], dtype=np.float64)
@@ -187,45 +208,141 @@ class ScriptedPushController:
             q_init=self.q_stage,
             prefer_fwd_vec=np.array([u_aim[0], u_aim[1], 0.85]),
         )
+        self.q_push_mid = solve_4dof_ik(
+            self.model,
+            self._ik_data,
+            self.ids,
+            p_mid,
+            self.q_min,
+            self.q_max,
+            q_init=self.q_stage,
+            prefer_fwd_vec=np.array([u_aim[0], u_aim[1], 0.55]),
+        )
+        self.q_push_end_safe = solve_4dof_ik(
+            self.model,
+            self._ik_data,
+            self.ids,
+            p_end_safe,
+            self.q_min,
+            self.q_max,
+            q_init=self.q_push_mid,
+            prefer_fwd_vec=np.array([u_aim[0], u_aim[1], 0.80]),
+        )
 
         self.phase = "lift"
         self._push_steps = 0
         self._hold_steps = 0
+        self._settle_steps = 0
+        self._step_idx = 0
+        self._est_lag = None
+        self._q0 = None
+        self._q_des = None
+
+    def _step_q_des(self, q_target: np.ndarray, max_step_rad: float) -> np.ndarray:
+        assert self._q_des is not None
+        delta = q_target - self._q_des
+        max_d = float(np.max(np.abs(delta)))
+        if max_d > max_step_rad and max_d > 1e-8:
+            self._q_des = self._q_des + delta * (max_step_rad / max_d)
+        else:
+            self._q_des = q_target.copy()
+        self._q_des = np.clip(self._q_des, self.q_min, self.q_max)
+        return self._q_des
 
     def step(self, q_measured: np.ndarray) -> np.ndarray:
         """Compute normalized 4-DOF position-delta action ``a in [-1, 1]^4`` at 20 Hz."""
         qm = np.asarray(q_measured, dtype=np.float64)
+        max_act = float(self.cfg.robot.max_action_rad)
         speed_scale = float(np.clip(self.params.push_speed_mps / 0.85, 0.25, 1.0))
 
+        if self._step_idx == 0:
+            self._q0 = qm.copy()
+            self._q_des = qm.copy()
+        elif self._est_lag is None:
+            assert self._q0 is not None
+            if float(np.max(np.abs(qm - self._q0))) > 0.008:
+                self._est_lag = min(2, self._step_idx - 1)
+            elif self._step_idx >= 3:
+                self._est_lag = 2
+        self._step_idx += 1
+
+        if self._est_lag == 0:
+            if self.phase == "lift":
+                q_ref = self.q_lift
+                scale = 1.0
+                if np.max(np.abs(qm - self.q_lift)) < 0.04:
+                    self.phase = "stage"
+            elif self.phase == "stage":
+                q_ref = self.q_stage
+                scale = 1.0
+                if np.max(np.abs(qm - self.q_stage)) < 0.04:
+                    self.phase = "push"
+                    self._push_steps = 0
+            elif self.phase == "push":
+                self._push_steps += 1
+                q_ref = self.q_push_end
+                scale = 0.47 * speed_scale if self._push_steps == 1 else speed_scale
+                if self._push_steps >= 4:
+                    self.phase = "hold"
+                    self._hold_steps = 0
+            elif self.phase == "hold":
+                self._hold_steps += 1
+                if self._hold_steps >= 6:
+                    self.phase = "retract"
+                return np.zeros(len(ACTIVE_JOINTS), dtype=np.float32)
+            else:
+                q_ref = self.q_lift
+                scale = 1.0
+
+            raw_a = (q_ref - qm) / max_act
+            max_a = float(np.max(np.abs(raw_a)))
+            if max_a > scale and max_a > 1e-8:
+                raw_a = raw_a * (scale / max_a)
+            return np.clip(raw_a, -1.0, 1.0).astype(np.float32)
+
+        # Lag-adaptive monotonic command generation (used during initial lag probe and lag >= 1).
         if self.phase == "lift":
-            q_ref = self.q_lift
-            scale = 1.0
-            if np.max(np.abs(qm - self.q_lift)) < 0.04:
+            q_ref = self._step_q_des(self.q_lift, 0.85 * max_act)
+            if (
+                np.max(np.abs(q_ref - self.q_lift)) < 1e-6
+                and np.max(np.abs(qm - self.q_lift)) < 0.045
+            ):
                 self.phase = "stage"
+                self._settle_steps = 0
         elif self.phase == "stage":
-            q_ref = self.q_stage
-            scale = 1.0
-            if np.max(np.abs(qm - self.q_stage)) < 0.04:
+            q_ref = self._step_q_des(self.q_stage, 0.70 * max_act)
+            if np.max(np.abs(q_ref - self.q_stage)) < 1e-6:
+                self._settle_steps += 1
+            if (
+                self._settle_steps >= 4 and np.max(np.abs(qm - self.q_stage)) < 0.035
+            ) or self._settle_steps >= 8:
                 self.phase = "push"
                 self._push_steps = 0
         elif self.phase == "push":
             self._push_steps += 1
-            q_ref = self.q_push_end
-            scale = 0.47 * speed_scale if self._push_steps == 1 else speed_scale
-            if self._push_steps >= 4:
+            ramp = (0.30, 0.48, 0.68, 0.88)
+            ramp_scale = ramp[self._push_steps - 1] if self._push_steps <= len(ramp) else 1.0
+            push_scale = ramp_scale * speed_scale
+            q_tgt = (
+                self.q_push_mid
+                if (self._push_steps <= 5 and np.max(np.abs(qm - self.q_push_mid)) > 0.15)
+                else self.q_push_end_safe
+            )
+            q_ref = self._step_q_des(q_tgt, push_scale * max_act)
+            if self._push_steps >= 11 or (
+                self._push_steps >= 6 and np.max(np.abs(qm - self.q_push_end_safe)) < 0.12
+            ):
                 self.phase = "hold"
                 self._hold_steps = 0
+                self._q_des = qm.copy()
         elif self.phase == "hold":
             self._hold_steps += 1
+            assert self._q_des is not None
+            q_ref = self._q_des
             if self._hold_steps >= 6:
                 self.phase = "retract"
-            return np.zeros(len(ACTIVE_JOINTS), dtype=np.float32)
         else:
-            q_ref = self.q_lift
-            scale = 1.0
+            q_ref = self._step_q_des(self.q_lift, 0.85 * max_act)
 
-        raw_a = (q_ref - qm) / float(self.cfg.robot.max_action_rad)
-        max_a = float(np.max(np.abs(raw_a)))
-        if max_a > scale and max_a > 1e-8:
-            raw_a = raw_a * (scale / max_a)
+        raw_a = (q_ref - qm) / max_act
         return np.clip(raw_a, -1.0, 1.0).astype(np.float32)

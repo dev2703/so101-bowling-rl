@@ -347,8 +347,17 @@ def test_train_sac_smoke_and_compare_baselines_cli(tmp_path: Path) -> None:
     assert out_json.exists()
     assert report["scripted_4dof"]["privileged_state"] is True
     assert report["scripted_4dof"]["episodes"] == 1
+    assert report["scripted_4dof"]["mean_episode_steps"] > 0.0
     assert report["sac"]["privileged_state"] is False
     assert report["sac"]["episodes"] == 1
+    assert report["sac"]["mean_episode_steps"] > 0.0
+    assert "training_metrics" in report["sac"]
+    assert report["sac"]["training_metrics"]["nan_inf_detected"] is False
+    assert "final_losses" in report["sac"]["training_metrics"]
+    assert "validation_loss_note" in report["sac"]["training_metrics"]
+    assert summary["nan_inf_detected"] is False
+    assert summary["eval_aux_loss"] is not None
+    assert summary["final_eval"]["mean_episode_steps"] > 0.0
 
 
 def test_sac_config_rejects_batch_size_above_usable_capacity_and_bool_ints() -> None:
@@ -399,4 +408,36 @@ def test_sac_config_rejects_batch_size_above_usable_capacity_and_bool_ints() -> 
     for field_name in ("dr_enabled", "autotune_alpha", "save_video"):
         with pytest.raises(ValueError, match=field_name):
             SACConfig(**{field_name: 1})
+
+
+def test_preflight_sac_passes_and_detects_nan(monkeypatch: pytest.MonkeyPatch) -> None:
+    from so101_bowling import sac as sac_mod
+    from so101_bowling.sac import preflight_sac
+
+    cfg = SACConfig(
+        num_envs=1,
+        capacity=32,
+        batch_size=4,
+        actor_lr=1.0e-3,
+        critic_lr=1.0e-3,
+        aux_coef=1.0,
+        device="cpu",
+    )
+    report = preflight_sac(cfg, workspace_cfg=load_config(), steps=100, batch_size=4)
+    assert report["algo"] == "sac"
+    assert report["passed"] is True
+    assert report["nan_inf_detected"] is False
+    assert report["aux_mask_active_elements"] > 0.0
+    assert report["final_losses"]["aux_loss"] < 0.08
+    assert report["final_losses"]["critic_loss"] < 0.08
+
+    monkeypatch.setattr(
+        sac_mod,
+        "masked_aux_loss",
+        lambda pred, tgt, mask: pred.sum() * 0.0 + float("nan"),
+    )
+    nan_report = preflight_sac(cfg, workspace_cfg=load_config(), steps=10, batch_size=4)
+    assert nan_report["passed"] is False
+    assert nan_report["nan_inf_detected"] is True
+    assert nan_report["checks"]["finite_ok"] is False
 

@@ -61,6 +61,8 @@ def collect_dataset(
     root = Path(out_dir)
     ep_dir = root / "episodes"
     ep_dir.mkdir(parents=True, exist_ok=True)
+    for stale_ep in ep_dir.glob("ep_*.npz"):
+        stale_ep.unlink()
     jsonl_path = root / "episodes.jsonl"
 
     rng = np.random.default_rng(seed)
@@ -135,6 +137,13 @@ def collect_dataset(
 
             outcome = info.get("outcome", {})
             if only_legal and not outcome.get("legal_delivery", False):
+                if attempts % 10 == 0:
+                    print(
+                        f"[collect_dataset] attempt {attempts}/{max_attempts}: "
+                        f"saved {saved_episodes}/{num_episodes} "
+                        f"(skipped: {outcome.get('invalid_reason')})",
+                        flush=True,
+                    )
                 continue
 
             ep_path = ep_dir / f"ep_{saved_episodes:06d}.npz"
@@ -162,6 +171,20 @@ def collect_dataset(
             outcomes.append(outcome)
             total_transitions += len(rew_buf)
             saved_episodes += 1
+            if saved_episodes % 10 == 0 or saved_episodes == num_episodes:
+                legal_so_far = sum(int(bool(o.get("legal_delivery", False))) for o in outcomes)
+                print(
+                    f"[collect_dataset] saved {saved_episodes}/{num_episodes} "
+                    f"legal={legal_so_far}/{saved_episodes} "
+                    f"transitions={total_transitions} (attempts={attempts})",
+                    flush=True,
+                )
+
+    if only_legal and saved_episodes < num_episodes:
+        raise RuntimeError(
+            f"collect_dataset(only_legal=True) collected only {saved_episodes}/{num_episodes} "
+            f"legal episodes within max_attempts={max_attempts}."
+        )
 
     n = max(1, saved_episodes)
     dataset_info: dict[str, Any] = {

@@ -247,3 +247,42 @@ def test_timestep_invariance_002_vs_004() -> None:
     assert rel_speed_diff <= 0.15, (
         f"Launch speed diverged across dt: {out_002.launch_speed:.3f} vs {out_004.launch_speed:.3f}"
     )
+
+
+def test_scripted_push_dr_legality_and_ball_jitter() -> None:
+    """Verify DR genuinely jitters ball/pins and ScriptedPushController stays >=85% legal."""
+    cfg = load_config()
+    nominal_ball = np.array([cfg.ball.spawn_pos[0], cfg.ball.spawn_pos[1], cfg.table.pad_thickness + cfg.ball.radius])
+    saw_ball_jitter = False
+    saw_pin_jitter = False
+    legal_count = 0
+    saw_lags: set[int] = set()
+    episodes = 20
+
+    with SO101BowlingEnv(cfg=cfg, dr_enabled=True, render_rgb=False) as env:
+        ctrl = ScriptedPushController(env.model, env.ids, cfg, env.q_min, env.q_max)
+        for seed in range(episodes):
+            _, reset_info = env.reset(seed=seed)
+            saw_lags.add(int(env._action_lag))
+            ball_pos = env.data.xpos[env.ids.ball_body_id].copy()
+            pin_pos = env.data.xpos[env.ids.pin_body_ids].copy()
+            if np.linalg.norm(ball_pos[:2] - nominal_ball[:2]) > 1e-4:
+                saw_ball_jitter = True
+            if np.linalg.norm(pin_pos[:, :2] - np.asarray(cfg.pin.positions)) > 1e-4:
+                saw_pin_jitter = True
+            assert np.allclose(ball_pos[:2], np.asarray(reset_info["randomization"]["ball_spawn"])[:2], atol=1e-4)
+
+            ctrl.reset(ball_pos, pin_pos)
+            info = {}
+            for _ in range(cfg.delivery.max_steps):
+                action = ctrl.step(env._measured_q())
+                _, _, done, _, info = env.step(action)
+                if done:
+                    break
+            if info["outcome"]["legal_delivery"]:
+                legal_count += 1
+
+    assert saw_ball_jitter, "DomainRandomizer failed to apply ball spawn jitter"
+    assert saw_pin_jitter, "DomainRandomizer failed to apply pin position jitter"
+    assert saw_lags == {0, 1, 2}, f"Expected all action lags {{0,1,2}}, saw {saw_lags}"
+    assert legal_count / episodes >= 0.85, f"DR legal rate too low: {legal_count}/{episodes}"
