@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import random
 from contextlib import ExitStack
 from dataclasses import asdict, dataclass
@@ -64,6 +65,78 @@ class PPOConfig:
     eval_episodes: int = 10
     checkpoint_interval_updates: int = 25
     save_video: bool = True
+
+    def __post_init__(self) -> None:
+        for name in (
+            "seed",
+            "frame_stack",
+            "num_envs",
+            "rollout_steps",
+            "total_timesteps",
+            "num_epochs",
+            "minibatch_size",
+            "drq_pad_px",
+            "eval_interval_updates",
+            "eval_episodes",
+            "checkpoint_interval_updates",
+        ):
+            val = getattr(self, name)
+            if isinstance(val, bool) or not isinstance(val, int):
+                raise ValueError(f"{name} must be an int, got {type(val).__name__}")
+        for name in ("dr_enabled", "anneal_lr", "save_video"):
+            val = getattr(self, name)
+            if not isinstance(val, bool):
+                raise ValueError(f"{name} must be a bool, got {type(val).__name__}")
+        for name in (
+            "num_envs",
+            "rollout_steps",
+            "total_timesteps",
+            "num_epochs",
+            "minibatch_size",
+            "eval_interval_updates",
+            "eval_episodes",
+            "checkpoint_interval_updates",
+            "frame_stack",
+        ):
+            if getattr(self, name) <= 0:
+                raise ValueError(f"{name} must be positive")
+        if self.drq_pad_px < 0:
+            raise ValueError("drq_pad_px must be nonnegative")
+        if self.encoder_type not in ("spatial_grid", "spatial_softmax"):
+            raise ValueError(f"Unsupported encoder_type: {self.encoder_type!r}")
+        for name in (
+            "lr",
+            "gamma",
+            "gae_lambda",
+            "clip_coef",
+            "vf_coef",
+            "ent_coef",
+            "aux_coef",
+            "max_grad_norm",
+        ):
+            raw_val = getattr(self, name)
+            if isinstance(raw_val, bool) or not isinstance(raw_val, (int, float)):
+                raise ValueError(f"{name} must be a real number, got {type(raw_val).__name__}")
+            if not math.isfinite(float(raw_val)):
+                raise ValueError(f"{name} must be finite, got {raw_val}")
+        if self.lr <= 0.0:
+            raise ValueError("lr must be positive")
+        if not (0.0 < self.gamma <= 1.0):
+            raise ValueError("gamma must be in (0, 1]")
+        if not (0.0 < self.gae_lambda <= 1.0):
+            raise ValueError("gae_lambda must be in (0, 1]")
+        if self.clip_coef <= 0.0:
+            raise ValueError("clip_coef must be positive")
+        if self.max_grad_norm <= 0.0:
+            raise ValueError("max_grad_norm must be positive")
+        for name in ("vf_coef", "ent_coef", "aux_coef"):
+            if getattr(self, name) < 0.0:
+                raise ValueError(f"{name} must be nonnegative")
+        if self.target_kl is not None:
+            if isinstance(self.target_kl, bool) or not isinstance(self.target_kl, (int, float)):
+                raise ValueError("target_kl must be a positive finite number or None")
+            if not math.isfinite(float(self.target_kl)) or self.target_kl <= 0.0:
+                raise ValueError("target_kl must be positive and finite")
 
 
 def load_ppo_config(path: str | Path | None = None) -> PPOConfig:
@@ -264,6 +337,7 @@ def evaluate_actor(
         raise ValueError("episodes must be positive")
 
     was_training = actor.training
+    orig_device = actor.log_std.device
     actor.eval()
     target_device = torch.device(device)
     actor.to(target_device)
@@ -329,6 +403,7 @@ def evaluate_actor(
     finally:
         if writer is not None:
             writer.release()
+        actor.to(orig_device)
         if was_training:
             actor.train()
 
@@ -719,9 +794,11 @@ def train_ppo(
         if not (out_dir / "best_actor.pt").exists():
             agent.actor.save_actor(out_dir / "best_actor.pt")
 
-    return {
+    summary = {
         "run_dir": str(out_dir),
         "global_step": global_step,
         "best_eval": best_eval,
         "last_metrics": last_log,
     }
+    (out_dir / "summary.json").write_text(json.dumps(summary, indent=2))
+    return summary

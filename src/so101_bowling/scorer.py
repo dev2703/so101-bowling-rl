@@ -264,6 +264,10 @@ class DeliveryScorer:
     def is_coast_settled(self, coast_elapsed_s) -> tuple[bool, bool]:
         if self.phase == DeliveryPhase.INVALID:
             return True, False
+        if self.phase == DeliveryPhase.APPROACH:
+            if coast_elapsed_s >= self.config.quiet_dwell_s:
+                return True, False
+            return False, False
         if self.phase == DeliveryPhase.RELEASED:
             if self._quiet_steps * self.config.sim_dt >= self.config.quiet_dwell_s:
                 return True, False
