@@ -86,3 +86,61 @@ def test_evaluate_actor_restores_training_mode_on_error(monkeypatch: pytest.Monk
     with pytest.raises(RuntimeError, match="boom"):
         evaluate_actor(actor=actor, cfg=load_config(), episodes=1, device="cpu")
     assert actor.training is True
+
+
+def test_runtime_nan_abort_ppo_and_sac(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import json
+    from so101_bowling import ppo as ppo_mod
+    from so101_bowling import sac as sac_mod
+    from so101_bowling.ppo import train_ppo
+    from so101_bowling.sac import SACConfig, train_sac
+
+    wcfg = load_config()
+
+    monkeypatch.setattr(
+        ppo_mod,
+        "masked_aux_loss",
+        lambda pred, tgt, mask: pred.sum() * 0.0 + float("nan"),
+    )
+    ppo_dir = tmp_path / "ppo_nan"
+    ppo_cfg = PPOConfig(
+        num_envs=1,
+        rollout_steps=4,
+        total_timesteps=4,
+        minibatch_size=4,
+        eval_episodes=1,
+        save_video=False,
+        device="cpu",
+    )
+    with pytest.raises(FloatingPointError, match="Non-finite"):
+        train_ppo(ppo_cfg=ppo_cfg, workspace_cfg=wcfg, run_dir=ppo_dir)
+    ppo_summary = json.loads((ppo_dir / "summary.json").read_text())
+    assert ppo_summary["nan_inf_detected"] is True
+    assert "Non-finite" in ppo_summary["nan_inf_error"]
+
+    monkeypatch.setattr(
+        sac_mod,
+        "masked_aux_loss",
+        lambda pred, tgt, mask: pred.sum() * 0.0 + float("inf"),
+    )
+    sac_dir = tmp_path / "sac_nan"
+    sac_cfg = SACConfig(
+        num_envs=1,
+        capacity=16,
+        batch_size=4,
+        learning_starts=0,
+        utd_ratio=1.0,
+        total_timesteps=4,
+        eval_interval_steps=4,
+        checkpoint_interval_steps=4,
+        eval_episodes=1,
+        save_video=False,
+        device="cpu",
+    )
+    with pytest.raises(FloatingPointError, match="Non-finite"):
+        train_sac(cfg=sac_cfg, workspace_cfg=wcfg, run_dir=sac_dir)
+    sac_summary = json.loads((sac_dir / "summary.json").read_text())
+    assert sac_summary["nan_inf_detected"] is True
+    assert "Non-finite" in sac_summary["nan_inf_error"]

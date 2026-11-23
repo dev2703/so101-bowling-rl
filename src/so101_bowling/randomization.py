@@ -136,8 +136,8 @@ class DomainRandomizer:
         pin_positions = [list(p) for p in self.cfg.pin.positions]
 
         if not dr_enabled:
-            self._set_free_bodies(data, (ball_x, ball_y, ball_z), pin_positions)
             mujoco.mj_setConst(m, data)
+            self._set_free_bodies(data, (ball_x, ball_y, ball_z), pin_positions)
             mujoco.mj_forward(m, data)
             return {
                 "dr_enabled": False,
@@ -254,8 +254,8 @@ class DomainRandomizer:
                 d_mid = self._distractor_mat_ids[idx]
                 m.mat_rgba[d_mid, :3] = rng.uniform(0.08, 0.92, size=3)
 
-        self._set_free_bodies(data, ball_spawn, pin_positions)
         mujoco.mj_setConst(m, data)
+        self._set_free_bodies(data, ball_spawn, pin_positions)
         mujoco.mj_forward(m, data)
 
         return {
