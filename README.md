@@ -15,6 +15,8 @@ Sim-to-real dual-camera reinforcement learning (Asymmetric PPO & Asymmetric SAC)
 uv sync --extra dev
 # Optional: for live SO-101 hardware
 uv sync --extra dev --extra hardware
+# Optional: for Hugging Face Hub uploads/downloads
+uv sync --extra dev --extra hub
 ```
 
 ## Testing
@@ -58,4 +60,25 @@ uv run python scripts/run_real_transfer.py run-trials \
 uv run python scripts/run_real_transfer.py run-trials \
   --checkpoint runs/sac/actor_best.pt --policy-name sac --trials 10 \
   --calibration path/to/follower.json --live --out-dir runs/live
+```
+
+## Datasets, Colab Pro Training & Hugging Face Hub
+
+```bash
+# Collect dual-camera scripted 4-DOF demo episodes
+uv run python scripts/collect_dataset.py --out-dir data/demos --episodes 100 --dr --only-legal
+
+# Warm-start SAC from demos and resume from checkpoint if interrupted
+uv run python scripts/train_sac.py --out-dir runs/sac --dr --demo-dataset data/demos
+uv run python scripts/train_sac.py --out-dir runs/sac --dr --resume runs/sac/checkpoint_latest.pt
+
+# End-to-end headless GPU training on Colab Pro (MUJOCO_GL=egl + auto HF Hub push)
+uv run python scripts/colab_train.py \
+  --algo sac --total-timesteps 100000 --collect-demos 100 --dr \
+  --hf-dataset-repo <user>/so101-bowling-demos \
+  --hf-model-repo <user>/so101-bowling-sac
+
+# Manually push model or dataset to Hugging Face Hub
+uv run python scripts/push_to_hub.py model --run-dir runs/sac --repo-id <user>/so101-bowling-sac
+uv run python scripts/push_to_hub.py dataset --dataset-dir data/demos --repo-id <user>/so101-bowling-demos
 ```
