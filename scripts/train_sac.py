@@ -14,7 +14,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Train dual-camera Asymmetric SAC on SO-101 bowling.")
     parser.add_argument("--config", type=str, default=None, help="Path to SAC YAML config.")
     parser.add_argument("--workspace-config", type=str, default=None, help="Path to workspace YAML.")
-    parser.add_argument("--out-dir", type=str, default="runs/sac", help="Output directory for logs/checkpoints.")
+    parser.add_argument("--out-dir", "--run-dir", dest="out_dir", type=str, default="runs/sac", help="Output directory for logs/checkpoints.")
     parser.add_argument("--total-timesteps", type=int, default=None)
     parser.add_argument("--num-envs", type=int, default=None)
     parser.add_argument("--capacity", type=int, default=None)
@@ -25,7 +25,9 @@ def main() -> None:
     parser.add_argument("--eval-episodes", type=int, default=None)
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--device", type=str, default=None)
+    parser.add_argument("--encoder-type", choices=("spatial_grid", "spatial_softmax"), default=None)
     parser.add_argument("--dr", action=argparse.BooleanOptionalAction, default=None, help="Enable/disable DR.")
+    parser.add_argument("--save-video", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--no-video", action="store_true", help="Disable evaluation video recording.")
     args = parser.parse_args()
 
@@ -42,6 +44,8 @@ def main() -> None:
         "eval_episodes",
         "seed",
         "device",
+        "encoder_type",
+        "save_video",
     ):
         val = getattr(args, field_name)
         if val is not None:
