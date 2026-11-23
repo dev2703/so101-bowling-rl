@@ -952,11 +952,15 @@ hardware = [
     { name = "feetech-servo-sdk" },
     { name = "lerobot" },
 ]
+hub = [
+    { name = "huggingface-hub" },
+]
 
 [package.metadata]
 requires-dist = [
     { name = "feetech-servo-sdk", marker = "extra == 'hardware'", specifier = ">=1.0.0" },
     { name = "gymnasium", specifier = ">=1.0.0" },
+    { name = "huggingface-hub", marker = "extra == 'hub'", specifier = ">=0.25.0" },
     { name = "lerobot", marker = "extra == 'hardware'", specifier = ">=0.5.0" },
     { name = "mujoco", specifier = ">=3.2.0" },
     { name = "numpy", specifier = ">=1.26.0,<2.3.0" },
@@ -966,7 +970,7 @@ requires-dist = [
     { name = "tensorboard", specifier = ">=2.17.0" },
     { name = "torch", specifier = ">=2.5.0" },
 ]
-provides-extras = ["dev", "hardware"]
+provides-extras = ["dev", "hardware", "hub"]
 
 [[package]]
 name = "sympy"

@@ -26,6 +26,9 @@ hardware = [
     "lerobot>=0.5.0",
     "feetech-servo-sdk>=1.0.0",
 ]
+hub = [
+    "huggingface-hub>=0.25.0",
+]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/so101_bowling"]
