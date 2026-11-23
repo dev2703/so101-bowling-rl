@@ -5,7 +5,7 @@ Sim-to-real dual-camera reinforcement learning (Asymmetric PPO & Asymmetric SAC)
 ## Overview
 
 - **Simulator (`M1`)**: MuJoCo 3-pin tabletop bowling environment (`SO101BowlingEnv`) with vendored SO-101 STL/MJCF assets, procedural hollow bowling pin meshes, `condim=6` rolling/sliding contact physics, domain randomization, a 4-phase delivery scorer (`DeliveryScorer`), and a 4-DOF damped-least-squares IK scripted baseline (`ScriptedPushController`).
-- **Asymmetric PPO (`M2`)**: Dual-camera (`wrist_cam` + `tripod_cam`, `64×112` frame-stacked RGB) deployable actor (`DualCameraActor`) trained with a privileged critic, visibility-masked auxiliary head, DrQ view shifts, and spawn-based vectorized environments (`SubprocVecBowlingEnv`).
+- **Asymmetric PPO (`M2`)**: Dual-camera (`wrist_cam` + `iphone_continuity_cam`, `64×112` frame-stacked RGB) deployable actor (`DualCameraActor`) trained with a privileged critic, visibility-masked auxiliary head, DrQ view shifts, and spawn-based vectorized environments (`SubprocVecBowlingEnv`).
 - **Real-Transfer Safety Bridge (`M3`)**: Thread-backed timestamped OpenCV cameras, full collision-volume MuJoCo FK safety guard with 16-corner servo-lag verification (`SafetyGuard`), LeRobot `SO101Follower` bridge (`SO101BowlingHardwareBridge`), passive camera gate, and trial harness (`scripts/run_real_transfer.py`).
 - **Asymmetric SAC (`M4`)**: Off-policy dual-camera SAC (`AsymmetricSACAgent`, `PrivilegedTwinQ`) with a generation-checked deduplicated raw-frame replay buffer (`RawFrameReplayBuffer`) and paired-seed baseline comparison (`scripts/compare_baselines.py`).
 
@@ -62,7 +62,7 @@ uv run python scripts/run_real_transfer.py run-trials \
   --calibration path/to/follower.json --live --out-dir runs/live
 ```
 
-## Datasets, Colab Pro Training & Hugging Face Hub
+## Datasets & Training
 
 ```bash
 # Collect dual-camera scripted 4-DOF demo episodes
@@ -72,7 +72,7 @@ uv run python scripts/collect_dataset.py --out-dir data/demos --episodes 100 --d
 uv run python scripts/train_sac.py --out-dir runs/sac --dr --demo-dataset data/demos
 uv run python scripts/train_sac.py --out-dir runs/sac --dr --resume runs/sac/checkpoint_latest.pt
 
-# End-to-end headless GPU training on Colab Pro (MUJOCO_GL=egl + auto HF Hub push)
+# End-to-end headless GPU training on Colab Pro or modal script (MUJOCO_GL=egl + auto HF Hub push)
 uv run python scripts/colab_train.py \
   --algo sac --total-timesteps 100000 --collect-demos 100 --dr \
   --hf-dataset-repo <user>/so101-bowling-demos \
