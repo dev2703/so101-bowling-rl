@@ -352,6 +352,8 @@ def train_sac(
     cfg: SACConfig,
     workspace_cfg: WorkspaceConfig | None = None,
     run_dir: str | Path = "runs/sac",
+    resume_from: str | Path | None = None,
+    demo_dataset: str | Path | None = None,
 ) -> dict[str, Any]:
     """Train AsymmetricSACAgent with RawFrameReplayBuffer and export standalone actors."""
     from so101_bowling.replay_buffer import RawFrameReplayBuffer
@@ -393,6 +395,12 @@ def train_sac(
         aux_mask_dim=AUX_MASK_DIM,
     )
 
+    demo_transitions_loaded = 0
+    if demo_dataset is not None:
+        from so101_bowling.dataset import load_dataset_into_replay_buffer
+
+        demo_transitions_loaded = load_dataset_into_replay_buffer(demo_dataset, buffer)
+
     metrics_path = out_dir / "metrics.jsonl"
     best_score: tuple[float, float, float] = (-1.0, -1.0, -float("inf"))
     best_eval: dict[str, Any] = {}
@@ -401,10 +409,27 @@ def train_sac(
     total_critic_updates = 0
     utd_carry = 0.0
 
-    next_eval_step = cfg.eval_interval_steps
-    next_ckpt_step = cfg.checkpoint_interval_steps
+    if resume_from is not None:
+        ckpt_path = Path(resume_from)
+        if not ckpt_path.exists():
+            raise FileNotFoundError(f"SAC resume checkpoint not found: {ckpt_path}")
+        ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+        agent.load_state_dict(ckpt["agent"])
+        actor_opt.load_state_dict(ckpt["actor_opt"])
+        critic_opt.load_state_dict(ckpt["critic_opt"])
+        if alpha_opt is not None and ckpt.get("alpha_opt") is not None:
+            alpha_opt.load_state_dict(ckpt["alpha_opt"])
+        global_step = int(ckpt.get("global_step", 0))
+        total_critic_updates = int(ckpt.get("total_critic_updates", 0))
+    elif metrics_path.exists():
+        metrics_path.unlink()
+
+    next_eval_step = ((global_step // cfg.eval_interval_steps) + 1) * cfg.eval_interval_steps
+    next_ckpt_step = (
+        (global_step // cfg.checkpoint_interval_steps) + 1
+    ) * cfg.checkpoint_interval_steps
     log_interval_steps = max(cfg.num_envs, min(1000, cfg.eval_interval_steps))
-    next_log_step = log_interval_steps
+    next_log_step = ((global_step // log_interval_steps) + 1) * log_interval_steps
 
     with ExitStack() as stack:
         writer = SummaryWriter(log_dir=str(out_dir / "tb"))
@@ -602,6 +627,7 @@ def train_sac(
         "global_step": global_step,
         "total_critic_updates": total_critic_updates,
         "buffer_size": len(buffer),
+        "demo_transitions_loaded": demo_transitions_loaded,
         "best_eval": best_eval,
         "last_metrics": last_log,
     }

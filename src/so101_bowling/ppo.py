@@ -482,6 +482,7 @@ def train_ppo(
     ppo_cfg: PPOConfig,
     workspace_cfg: WorkspaceConfig | None = None,
     run_dir: str | Path = "runs/ppo",
+    resume_from: str | Path | None = None,
 ) -> dict[str, Any]:
     """Train DualCameraActor + AsymmetricPPOAgent and export standalone actor checkpoints."""
     _validate_ppo_config(ppo_cfg)
@@ -518,6 +519,19 @@ def train_ppo(
     best_eval: dict[str, Any] = {}
     last_log: dict[str, Any] = {}
     global_step = 0
+    start_update = 1
+
+    if resume_from is not None:
+        ckpt_path = Path(resume_from)
+        if not ckpt_path.exists():
+            raise FileNotFoundError(f"PPO resume checkpoint not found: {ckpt_path}")
+        ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+        agent.load_state_dict(ckpt["agent"])
+        optimizer.load_state_dict(ckpt["optimizer"])
+        start_update = int(ckpt.get("update", 0)) + 1
+        global_step = int(ckpt.get("global_step", 0))
+    elif metrics_path.exists():
+        metrics_path.unlink()
 
     with ExitStack() as stack:
         writer = SummaryWriter(log_dir=str(out_dir / "tb"))
@@ -542,7 +556,7 @@ def train_ppo(
         ep_outcomes: list[dict[str, Any]] = []
         t_start = perf_counter()
 
-        for update in range(1, num_updates + 1):
+        for update in range(start_update, num_updates + 1):
             if ppo_cfg.anneal_lr:
                 frac = 1.0 - (update - 1.0) / num_updates
                 optimizer.param_groups[0]["lr"] = frac * ppo_cfg.lr
