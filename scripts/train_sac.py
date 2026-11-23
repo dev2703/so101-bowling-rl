@@ -29,6 +29,8 @@ def main() -> None:
     parser.add_argument("--dr", action=argparse.BooleanOptionalAction, default=None, help="Enable/disable DR.")
     parser.add_argument("--save-video", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--no-video", action="store_true", help="Disable evaluation video recording.")
+    parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint_latest.pt to resume.")
+    parser.add_argument("--demo-dataset", type=str, default=None, help="Path to collected dataset dir to prefill replay buffer.")
     args = parser.parse_args()
 
     sac_cfg = load_sac_config(args.config)
@@ -58,7 +60,13 @@ def main() -> None:
         sac_cfg = replace(sac_cfg, **overrides)
 
     wcfg = load_config(args.workspace_config)
-    summary = train_sac(cfg=sac_cfg, workspace_cfg=wcfg, run_dir=args.out_dir)
+    summary = train_sac(
+        cfg=sac_cfg,
+        workspace_cfg=wcfg,
+        run_dir=args.out_dir,
+        resume_from=args.resume,
+        demo_dataset=args.demo_dataset,
+    )
     print(json.dumps(summary, indent=2))
 
 

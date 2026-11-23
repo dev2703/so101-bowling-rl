@@ -22,6 +22,7 @@ def main() -> None:
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--encoder-type", choices=("spatial_grid", "spatial_softmax"), default=None)
     parser.add_argument("--run-dir", type=str, default="runs/ppo")
+    parser.add_argument("--resume", type=str, default=None, help="Path to latest.pt checkpoint to resume.")
     parser.add_argument("--save-video", action=argparse.BooleanOptionalAction, default=None)
     args = parser.parse_args()
 
@@ -45,7 +46,12 @@ def main() -> None:
         ppo_cfg = replace(ppo_cfg, **overrides)
 
     wcfg = load_config(args.workspace_config)
-    summary = train_ppo(ppo_cfg=ppo_cfg, workspace_cfg=wcfg, run_dir=args.run_dir)
+    summary = train_ppo(
+        ppo_cfg=ppo_cfg,
+        workspace_cfg=wcfg,
+        run_dir=args.run_dir,
+        resume_from=args.resume,
+    )
     print(json.dumps(summary, indent=2))
 
 
