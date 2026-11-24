@@ -237,7 +237,7 @@ def main(argv: list[str] | None = None) -> None:
     from so101_bowling.config import load_config
     from so101_bowling.dagger import load_dagger_config, train_dagger
     from so101_bowling.dataset import collect_dataset
-    from so101_bowling.hub import _ACTOR_CANDIDATES, push_dataset_to_hub, push_model_to_hub
+    from so101_bowling.hub import _PUSH_MODEL_CANDIDATES, push_dataset_to_hub, push_model_to_hub
     from so101_bowling.ppo import load_ppo_config, preflight_ppo, train_ppo
     from so101_bowling.sac import load_sac_config, preflight_sac, train_sac
     from so101_bowling.teacher import load_teacher_config, train_teacher_ppo
@@ -442,7 +442,7 @@ def main(argv: list[str] | None = None) -> None:
         raise
     except KeyboardInterrupt as exc:
         salvage_url = _salvage_push_model(
-            run_dir, args, _ACTOR_CANDIDATES, push_model_to_hub, "interrupt"
+            run_dir, args, _PUSH_MODEL_CANDIDATES, push_model_to_hub, "interrupt"
         )
         _write_status(
             status_path,
@@ -453,7 +453,7 @@ def main(argv: list[str] | None = None) -> None:
         sys.exit(130)
     except Exception as exc:
         salvage_url = _salvage_push_model(
-            run_dir, args, _ACTOR_CANDIDATES, push_model_to_hub, "failure"
+            run_dir, args, _PUSH_MODEL_CANDIDATES, push_model_to_hub, "failure"
         )
         _write_status(
             status_path,

@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any
 
 DEFAULT_REPO_URL = "https://github.com/dev2703/so101-bowling-rl.git"
-DEFAULT_BRANCH = "feat/m1-preflight-dr-hub-fixes"
+DEFAULT_BRANCH = "main"
 DEFAULT_REMOTE_REPO_DIR = "/content/so101-bowling-rl"
 DEFAULT_REMOTE_RUN_DIR = "/content/runs/colab_run"
 DOWNLOAD_FILES = (
