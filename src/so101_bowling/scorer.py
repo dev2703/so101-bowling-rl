@@ -36,6 +36,7 @@ class ScorerConfig:
     quiet_dwell_s: float = 0.25
     max_coast_s: float = 2.5
     w_stage_phi: float = 0.40
+    w_push_phi: float = 0.60
     w_contact_speed: float = 0.60
     w_launch_angle: float = 0.60
     w_action_jerk: float = 0.005
@@ -119,9 +120,14 @@ class DeliveryScorer:
             self._phi_prev = self.compute_potential(paddle_init_pos)
 
     def compute_potential(self, paddle_pos) -> float:
-        if self.phase != DeliveryPhase.APPROACH or self._terminated:
+        if self._terminated or self.phase == DeliveryPhase.INVALID:
             return 0.0
         cfg = self.config
+        if self.phase == DeliveryPhase.PUSHING:
+            push_progress = float(np.clip(self.max_contact_fwd_disp / 0.10, 0.0, 1.0))
+            return float(cfg.w_stage_phi + cfg.w_push_phi * push_progress)
+        if self.phase == DeliveryPhase.RELEASED:
+            return float(cfg.w_stage_phi + cfg.w_push_phi)
         paddle = np.asarray(paddle_pos)
         distance_to_stage = np.linalg.norm(paddle - self.p_stage)
         # A clearance gate suppresses reward near the ball center, and the

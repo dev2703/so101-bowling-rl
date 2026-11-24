@@ -27,7 +27,11 @@ def _write_status(path: Path, state: str, extra: dict[str, Any] | None = None) -
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--algo", choices=("sac", "ppo"), default="sac")
+    parser.add_argument("--algo", choices=("sac", "ppo", "teacher", "dagger"), default="sac")
+    parser.add_argument("--teacher-checkpoint", type=str, default=None, help="Teacher .pt path for --algo dagger.")
+    parser.add_argument("--bc-warmup-episodes", type=int, default=None, help="Scripted BC warmup episodes for --algo teacher.")
+    parser.add_argument("--rounds", type=int, default=None, help="Number of DAgger rounds for --algo dagger.")
+    parser.add_argument("--steps-per-round", type=int, default=None, help="Env steps per DAgger round.")
     parser.add_argument("--config", type=str, default=None, help="Path to SAC or PPO YAML config.")
     parser.add_argument("--workspace-config", type=str, default=None)
     parser.add_argument("--run-dir", type=str, default="runs/colab_run")
@@ -231,10 +235,12 @@ def main(argv: list[str] | None = None) -> None:
         os.environ["MUJOCO_GL"] = args.mujoco_gl
 
     from so101_bowling.config import load_config
+    from so101_bowling.dagger import load_dagger_config, train_dagger
     from so101_bowling.dataset import collect_dataset
     from so101_bowling.hub import _ACTOR_CANDIDATES, push_dataset_to_hub, push_model_to_hub
     from so101_bowling.ppo import load_ppo_config, preflight_ppo, train_ppo
     from so101_bowling.sac import load_sac_config, preflight_sac, train_sac
+    from so101_bowling.teacher import load_teacher_config, train_teacher_ppo
     from so101_bowling.tracking import WandbConfig, parse_wandb_tags
 
     run_dir = Path(args.run_dir)
@@ -346,6 +352,54 @@ def main(argv: list[str] | None = None) -> None:
                 run_dir=run_dir,
                 resume_from=args.resume,
                 demo_dataset=demo_dir if demo_dir.exists() and (demo_dir / "episodes").is_dir() else None,
+                wandb_cfg=wandb_cfg,
+            )
+        elif args.algo == "teacher":
+            t_ov: dict[str, Any] = {"dr_enabled": args.dr}
+            for k, v in (
+                ("total_timesteps", args.total_timesteps),
+                ("num_envs", args.num_envs),
+                ("seed", args.seed),
+                ("device", args.device),
+                ("lr", args.lr),
+                ("rollout_steps", args.rollout_steps),
+                ("eval_episodes", args.eval_episodes),
+                ("eval_interval_updates", args.eval_interval_updates or args.eval_interval),
+                ("bc_warmup_episodes", args.bc_warmup_episodes),
+            ):
+                if v is not None:
+                    t_ov[k] = v
+            t_cfg = replace(load_teacher_config(args.config), **t_ov)
+            summary = train_teacher_ppo(
+                cfg=t_cfg,
+                workspace_cfg=wcfg,
+                run_dir=run_dir,
+                resume_from=args.resume,
+                wandb_cfg=wandb_cfg,
+            )
+        elif args.algo == "dagger":
+            if not args.teacher_checkpoint:
+                raise ValueError("--algo dagger requires --teacher-checkpoint")
+            d_ov: dict[str, Any] = {"dr_enabled": args.dr}
+            for k, v in (
+                ("num_envs", args.num_envs),
+                ("seed", args.seed),
+                ("device", args.device),
+                ("lr", args.lr),
+                ("rounds", args.rounds),
+                ("steps_per_round", args.steps_per_round),
+                ("eval_episodes", args.eval_episodes),
+                ("save_video", args.save_video),
+                ("encoder_type", args.encoder_type),
+            ):
+                if v is not None:
+                    d_ov[k] = v
+            d_cfg = replace(load_dagger_config(args.config), **d_ov)
+            summary = train_dagger(
+                cfg=d_cfg,
+                teacher_path=args.teacher_checkpoint,
+                workspace_cfg=wcfg,
+                run_dir=run_dir,
                 wandb_cfg=wandb_cfg,
             )
         else:

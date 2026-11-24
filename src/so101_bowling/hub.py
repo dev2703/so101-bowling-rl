@@ -9,6 +9,7 @@ from typing import Any
 from so101_bowling.ppo_models import DualCameraActor, load_actor
 
 _ACTOR_CANDIDATES = ("actor_best.pt", "best_actor.pt", "actor_latest.pt", "final_actor.pt")
+_PUSH_MODEL_CANDIDATES = (*_ACTOR_CANDIDATES, "best_teacher.pt", "final_teacher.pt")
 
 
 def _get_hf_api(token: str | None = None) -> Any:
@@ -184,13 +185,20 @@ def push_model_to_hub(
     if not root.is_dir():
         raise FileNotFoundError(f"Run directory not found: {root}")
 
-    found_actors = [name for name in _ACTOR_CANDIDATES if (root / name).exists()]
+    found_actors = [name for name in _PUSH_MODEL_CANDIDATES if (root / name).exists()]
     if not found_actors:
         raise FileNotFoundError(
-            f"No exported actor checkpoint ({_ACTOR_CANDIDATES}) found in {root}"
+            f"No exported actor checkpoint ({_PUSH_MODEL_CANDIDATES}) found in {root}"
         )
 
-    algo = "sac" if (root / "sac_config.json").exists() else "ppo"
+    if (root / "sac_config.json").exists():
+        algo = "sac"
+    elif (root / "teacher_config.json").exists():
+        algo = "teacher"
+    elif (root / "dagger_config.json").exists():
+        algo = "dagger"
+    else:
+        algo = "ppo"
     cfg_path = root / f"{algo}_config.json"
     config = json.loads(cfg_path.read_text()) if cfg_path.exists() else None
     summary_path = root / "summary.json"
@@ -211,6 +219,7 @@ def push_model_to_hub(
         allow_patterns=[
             "README.md",
             "*actor*.pt",
+            "*teacher*.pt",
             "*_config.json",
             "summary.json",
             "preflight_report.json",
