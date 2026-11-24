@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import netrc
 import os
 import re
 import shlex
@@ -64,6 +65,24 @@ def _find_local_hf_token() -> str | None:
             tok = candidate.read_text(encoding="utf-8").strip()
             if tok:
                 return tok
+    return None
+
+
+def _find_local_wandb_api_key() -> str | None:
+    env_key = os.environ.get("WANDB_API_KEY", "").strip()
+    if env_key:
+        return env_key
+    try:
+        netrc_path = Path.home() / ".netrc"
+        if netrc_path.is_file():
+            nrc = netrc.netrc(str(netrc_path))
+            auth = nrc.authenticators("api.wandb.ai")
+            if auth and auth[2]:
+                key = auth[2].strip()
+                if key:
+                    return key
+    except Exception:
+        pass
     return None
 
 
@@ -131,6 +150,7 @@ def build_bootstrap_script(
     branch: str,
     remote_repo_dir: str,
     hf_token_remote_tmp: str = "/content/.hf_token_tmp",
+    wandb_key_remote_tmp: str = "/content/.wandb_api_key_tmp",
 ) -> str:
     return f"""import os
 import shutil
@@ -141,6 +161,7 @@ repo_url = {repo_url!r}
 branch = {branch!r}
 repo_dir = Path({remote_repo_dir!r})
 token_tmp = Path({hf_token_remote_tmp!r})
+wandb_tmp = Path({wandb_key_remote_tmp!r})
 
 env = os.environ.copy()
 local_bin = str(Path.home() / ".local" / "bin")
@@ -154,6 +175,14 @@ if token_tmp.exists():
     shutil.move(str(token_tmp), str(hf_tok))
     os.chmod(hf_tok, 0o600)
     print("Configured Hugging Face token (mode 0600)", flush=True)
+
+if wandb_tmp.exists():
+    wb_dir = Path.home() / ".config" / "so101_bowling"
+    wb_dir.mkdir(parents=True, exist_ok=True)
+    wb_key = wb_dir / "wandb_api_key"
+    shutil.move(str(wandb_tmp), str(wb_key))
+    os.chmod(wb_key, 0o600)
+    print("Configured W&B API key (mode 0600)", flush=True)
 
 if not (repo_dir / ".git").exists():
     repo_dir.parent.mkdir(parents=True, exist_ok=True)
@@ -170,14 +199,14 @@ venv_python = repo_dir / ".venv" / "bin" / "python"
 if not venv_python.exists():
     subprocess.run([uv_bin, "venv", "--python", "3.12", str(repo_dir / ".venv")], cwd=repo_dir, check=True, env=env)
 
-subprocess.run([uv_bin, "sync", "--extra", "hub", "--extra", "dev"], cwd=repo_dir, check=True, env=env)
+subprocess.run([uv_bin, "sync", "--extra", "hub", "--extra", "dev", "--extra", "tracking"], cwd=repo_dir, check=True, env=env)
 subprocess.run(
     [
         str(venv_python),
         "-c",
-        "import torch, huggingface_hub, mujoco; "
+        "import torch, huggingface_hub, mujoco, wandb; "
         "print('torch:', torch.__version__, 'cuda:', torch.cuda.is_available(), "
-        "'hf:', huggingface_hub.__version__, 'mujoco:', mujoco.__version__)",
+        "'hf:', huggingface_hub.__version__, 'mujoco:', mujoco.__version__, 'wandb:', wandb.__version__)",
     ],
     cwd=repo_dir,
     check=True,
@@ -193,6 +222,7 @@ def build_spawn_script(
     train_args: list[str],
     session: str,
     hf_token_remote_tmp: str = "/content/.hf_token_tmp",
+    wandb_key_remote_tmp: str = "/content/.wandb_api_key_tmp",
 ) -> str:
     return f"""import json
 import os
@@ -205,6 +235,7 @@ repo_dir = Path({remote_repo_dir!r})
 run_dir = Path({remote_run_dir!r})
 run_dir.mkdir(parents=True, exist_ok=True)
 token_tmp = Path({hf_token_remote_tmp!r})
+wandb_tmp = Path({wandb_key_remote_tmp!r})
 
 if token_tmp.exists():
     hf_dir = Path.home() / ".cache" / "huggingface"
@@ -212,6 +243,12 @@ if token_tmp.exists():
     hf_tok = hf_dir / "token"
     shutil.move(str(token_tmp), str(hf_tok))
     os.chmod(hf_tok, 0o600)
+
+wb_key_file = Path.home() / ".config" / "so101_bowling" / "wandb_api_key"
+if wandb_tmp.exists():
+    wb_key_file.parent.mkdir(parents=True, exist_ok=True)
+    shutil.move(str(wandb_tmp), str(wb_key_file))
+    os.chmod(wb_key_file, 0o600)
 
 venv_python = str(repo_dir / ".venv" / "bin" / "python")
 cmd = [venv_python, "scripts/colab_train.py", *{train_args!r}]
@@ -222,6 +259,10 @@ status_path = run_dir / "status.json"
 env = os.environ.copy()
 env["MUJOCO_GL"] = "egl"
 env["PYTHONUNBUFFERED"] = "1"
+if wb_key_file.is_file() and not env.get("WANDB_API_KEY"):
+    wb_val = wb_key_file.read_text(encoding="utf-8").strip()
+    if wb_val:
+        env["WANDB_API_KEY"] = wb_val
 
 with log_path.open("ab") as log_fh:
     proc = subprocess.Popen(
@@ -326,6 +367,19 @@ def cmd_launch(args: argparse.Namespace, colab_prefix: list[str]) -> dict[str, A
                 upload_target = "<redacted_hf_token>" if dry_run else str(tok_file)
                 _run_cmd(
                     [*colab_prefix, "upload", upload_target, "/content/.hf_token_tmp", "-s", session],
+                    dry_run=dry_run,
+                    check=True,
+                )
+
+        if args.forward_wandb_key:
+            wb_key = _find_local_wandb_api_key()
+            if wb_key is not None:
+                wb_file = tmp_path / "wandb_api_key"
+                wb_file.write_text(wb_key, encoding="utf-8")
+                os.chmod(wb_file, 0o600)
+                upload_target = "<redacted_wandb_key>" if dry_run else str(wb_file)
+                _run_cmd(
+                    [*colab_prefix, "upload", upload_target, "/content/.wandb_api_key_tmp", "-s", session],
                     dry_run=dry_run,
                     check=True,
                 )
@@ -452,6 +506,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p_launch.add_argument("--remote-repo-dir", type=str, default=DEFAULT_REMOTE_REPO_DIR)
     p_launch.add_argument("--remote-run-dir", type=str, default=DEFAULT_REMOTE_RUN_DIR)
     p_launch.add_argument("--forward-hf-token", action=argparse.BooleanOptionalAction, default=True)
+    p_launch.add_argument("--forward-wandb-key", action=argparse.BooleanOptionalAction, default=True)
     p_launch.add_argument("--skip-bootstrap", action="store_true")
     p_launch.add_argument(
         "train_args",

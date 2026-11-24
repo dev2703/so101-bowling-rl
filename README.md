@@ -17,6 +17,8 @@ uv sync --extra dev
 uv sync --extra dev --extra hardware
 # Optional: for Hugging Face Hub uploads/downloads
 uv sync --extra dev --extra hub
+# Optional: for Weights & Biases experiment tracking
+uv sync --extra dev --extra tracking
 ```
 
 ## Testing
@@ -72,9 +74,10 @@ uv run python scripts/collect_dataset.py --out-dir data/demos --episodes 100 --d
 uv run python scripts/train_sac.py --out-dir runs/sac --dr --demo-dataset data/demos
 uv run python scripts/train_sac.py --out-dir runs/sac --dr --resume runs/sac/checkpoint_latest.pt
 
-# End-to-end headless GPU training on Colab Pro or modal script (MUJOCO_GL=egl + auto HF Hub push)
+# End-to-end headless GPU training on Colab Pro or modal script (MUJOCO_GL=egl + auto HF Hub & W&B)
 uv run python scripts/colab_train.py \
   --algo sac --total-timesteps 100000 --collect-demos 100 --dr \
+  --wandb-project so101-bowling-rl \
   --hf-dataset-repo <user>/so101-bowling-demos \
   --hf-model-repo <user>/so101-bowling-sac
 

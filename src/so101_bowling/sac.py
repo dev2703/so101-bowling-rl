@@ -38,6 +38,7 @@ from so101_bowling.ppo_models import (
     masked_aux_loss,
 )
 from so101_bowling.sac_models import AsymmetricSACAgent
+from so101_bowling.tracking import WandbConfig, WandbTracker
 from so101_bowling.vec_env import make_vec_env
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -439,6 +440,7 @@ def _write_sac_summary(
     nan_inf_detected: bool,
     nan_inf_error: str | None = None,
     interrupted: bool = False,
+    wandb_url: str | None = None,
 ) -> dict[str, Any]:
     eval_aux_loss = last_eval.get("eval_aux_loss")
     if eval_aux_loss is None and best_eval:
@@ -459,6 +461,8 @@ def _write_sac_summary(
         "nan_inf_detected": bool(nan_inf_detected),
         "validation_loss_note": VALIDATION_LOSS_NOTE,
     }
+    if wandb_url is not None:
+        summary["wandb_url"] = wandb_url
     if nan_inf_error is not None:
         summary["nan_inf_error"] = nan_inf_error
     if interrupted:
@@ -681,6 +685,7 @@ def train_sac(
     run_dir: str | Path = "runs/sac",
     resume_from: str | Path | None = None,
     demo_dataset: str | Path | None = None,
+    wandb_cfg: WandbConfig | None = None,
 ) -> dict[str, Any]:
     """Train AsymmetricSACAgent with RawFrameReplayBuffer and export standalone actors."""
     from so101_bowling.replay_buffer import RawFrameReplayBuffer
@@ -791,6 +796,15 @@ def train_sac(
     ) * cfg.checkpoint_interval_steps
     log_interval_steps = max(cfg.num_envs, min(1000, cfg.eval_interval_steps))
     next_log_step = ((global_step // log_interval_steps) + 1) * log_interval_steps
+
+    tracker = WandbTracker(
+        wandb_cfg,
+        run_dir=out_dir,
+        algo="sac",
+        train_config={**asdict(cfg), "demo_transitions_loaded": demo_transitions_loaded},
+    )
+    if tracker.run_url:
+        print(f"[sac] wandb_url={tracker.run_url}", flush=True)
 
     try:
         with ExitStack() as stack:
@@ -943,6 +957,13 @@ def train_sac(
                         f"eval_aux={ev.get('eval_aux_loss')}",
                         flush=True,
                     )
+                    if vid_path is not None:
+                        tracker.log_video(
+                            "sac/eval_video",
+                            vid_path,
+                            step=global_step,
+                            fps=int(round(wcfg.robot.control_hz)),
+                        )
 
                 if should_log:
                     while next_log_step <= global_step:
@@ -1020,6 +1041,7 @@ def train_sac(
                             and key != "global_step"
                         ):
                             writer.add_scalar(f"sac/{key}", val, global_step)
+                    tracker.log_metrics("sac", log_row, step=global_step)
                     with metrics_path.open("a") as f:
                         f.write(json.dumps(log_row) + "\n")
                     last_log = log_row
@@ -1057,7 +1079,7 @@ def train_sac(
             if not (out_dir / "actor_best.pt").exists():
                 agent.actor.save_actor(out_dir / "actor_best.pt")
     except FloatingPointError as exc:
-        _write_sac_summary(
+        summary = _write_sac_summary(
             out_dir,
             global_step=global_step,
             total_timesteps=cfg.total_timesteps,
@@ -1070,7 +1092,10 @@ def train_sac(
             last_log=last_log,
             nan_inf_detected=True,
             nan_inf_error=str(exc),
+            wandb_url=tracker.run_url,
         )
+        tracker.update_summary(summary)
+        tracker.finish(exit_code=1)
         raise
     except KeyboardInterrupt:
         agent.actor.save_actor(out_dir / "actor_latest.pt")
@@ -1091,7 +1116,7 @@ def train_sac(
             last_log=last_log,
             last_eval=last_eval,
         )
-        _write_sac_summary(
+        summary = _write_sac_summary(
             out_dir,
             global_step=global_step,
             total_timesteps=cfg.total_timesteps,
@@ -1104,10 +1129,16 @@ def train_sac(
             last_log=last_log,
             nan_inf_detected=False,
             interrupted=True,
+            wandb_url=tracker.run_url,
         )
+        tracker.update_summary(summary)
+        tracker.finish(exit_code=130)
+        raise
+    except Exception:
+        tracker.finish(exit_code=1)
         raise
 
-    return _write_sac_summary(
+    summary = _write_sac_summary(
         out_dir,
         global_step=global_step,
         total_timesteps=cfg.total_timesteps,
@@ -1119,4 +1150,8 @@ def train_sac(
         last_eval=last_eval,
         last_log=last_log,
         nan_inf_detected=False,
+        wandb_url=tracker.run_url,
     )
+    tracker.update_summary(summary)
+    tracker.finish(exit_code=0)
+    return summary

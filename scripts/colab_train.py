@@ -109,6 +109,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--checkpoint-interval-steps", type=int, default=None)
     parser.add_argument("--pretrain-steps", type=int, default=None)
 
+    # W&B tracking options
+    parser.add_argument("--wandb-project", type=str, default=None, help="W&B project name (enables W&B).")
+    parser.add_argument("--wandb-entity", type=str, default=None, help="W&B entity/team name.")
+    parser.add_argument("--wandb-run-name", type=str, default=None, help="W&B run display name.")
+    parser.add_argument("--wandb-group", type=str, default=None, help="W&B run group.")
+    parser.add_argument("--wandb-tags", type=str, default=None, help="Comma-separated W&B tags.")
+    parser.add_argument("--wandb-mode", choices=("online", "offline", "disabled"), default="online")
+
     return parser.parse_args(argv)
 
 
@@ -227,6 +235,7 @@ def main(argv: list[str] | None = None) -> None:
     from so101_bowling.hub import _ACTOR_CANDIDATES, push_dataset_to_hub, push_model_to_hub
     from so101_bowling.ppo import load_ppo_config, preflight_ppo, train_ppo
     from so101_bowling.sac import load_sac_config, preflight_sac, train_sac
+    from so101_bowling.tracking import WandbConfig, parse_wandb_tags
 
     run_dir = Path(args.run_dir)
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -314,6 +323,19 @@ def main(argv: list[str] | None = None) -> None:
                     private=args.hf_private,
                 )
 
+        wandb_cfg = (
+            WandbConfig(
+                project=args.wandb_project,
+                entity=args.wandb_entity,
+                run_name=args.wandb_run_name,
+                group=args.wandb_group,
+                tags=parse_wandb_tags(args.wandb_tags),
+                mode=args.wandb_mode,
+            )
+            if args.wandb_project
+            else None
+        )
+
         _write_status(status_path, "training", {"algo": args.algo})
         print(f"[colab_train] stage=training algo={args.algo}", flush=True)
         if args.algo == "sac":
@@ -324,6 +346,7 @@ def main(argv: list[str] | None = None) -> None:
                 run_dir=run_dir,
                 resume_from=args.resume,
                 demo_dataset=demo_dir if demo_dir.exists() and (demo_dir / "episodes").is_dir() else None,
+                wandb_cfg=wandb_cfg,
             )
         else:
             ppo_cfg = replace(load_ppo_config(args.config), **_build_ppo_overrides(args))
@@ -332,6 +355,7 @@ def main(argv: list[str] | None = None) -> None:
                 workspace_cfg=wcfg,
                 run_dir=run_dir,
                 resume_from=args.resume,
+                wandb_cfg=wandb_cfg,
             )
 
         model_url = None
@@ -352,6 +376,7 @@ def main(argv: list[str] | None = None) -> None:
                 "summary": summary,
                 "demo_episodes": demo_info["num_episodes"] if demo_info else 0,
                 "hf_model_url": model_url,
+                "wandb_url": summary.get("wandb_url"),
             },
         )
         print(f"[colab_train] stage=completed hf_model_url={model_url}", flush=True)

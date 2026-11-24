@@ -29,6 +29,9 @@ hardware = [
 hub = [
     "huggingface-hub>=0.25.0",
 ]
+tracking = [
+    "wandb>=0.18.0",
+]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/so101_bowling"]

@@ -33,6 +33,7 @@ from so101_bowling.ppo_models import (
     PROPRIO_DIM,
     masked_aux_loss,
 )
+from so101_bowling.tracking import WandbConfig, WandbTracker
 from so101_bowling.vec_env import make_vec_env
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -601,6 +602,7 @@ def _write_ppo_summary(
     nan_inf_detected: bool,
     nan_inf_error: str | None = None,
     interrupted: bool = False,
+    wandb_url: str | None = None,
 ) -> dict[str, Any]:
     eval_aux_loss = last_eval.get("eval_aux_loss")
     if eval_aux_loss is None and best_eval:
@@ -617,6 +619,8 @@ def _write_ppo_summary(
         "nan_inf_detected": bool(nan_inf_detected),
         "validation_loss_note": VALIDATION_LOSS_NOTE,
     }
+    if wandb_url is not None:
+        summary["wandb_url"] = wandb_url
     if nan_inf_error is not None:
         summary["nan_inf_error"] = nan_inf_error
     if interrupted:
@@ -913,6 +917,7 @@ def train_ppo(
     workspace_cfg: WorkspaceConfig | None = None,
     run_dir: str | Path = "runs/ppo",
     resume_from: str | Path | None = None,
+    wandb_cfg: WandbConfig | None = None,
 ) -> dict[str, Any]:
     """Train DualCameraActor + AsymmetricPPOAgent and export standalone actor checkpoints."""
     _validate_ppo_config(ppo_cfg)
@@ -1009,6 +1014,15 @@ def train_ppo(
             },
             out_dir / "latest.pt",
         )
+
+    tracker = WandbTracker(
+        wandb_cfg,
+        run_dir=out_dir,
+        algo="ppo",
+        train_config=asdict(ppo_cfg),
+    )
+    if tracker.run_url:
+        print(f"[ppo] wandb_url={tracker.run_url}", flush=True)
 
     try:
         with ExitStack() as stack:
@@ -1305,6 +1319,13 @@ def train_ppo(
                         f"eval_aux={ev.get('eval_aux_loss')}",
                         flush=True,
                     )
+                    if vid_path is not None:
+                        tracker.log_video(
+                            "ppo/eval_video",
+                            vid_path,
+                            step=global_step,
+                            fps=int(round(wcfg.robot.control_hz)),
+                        )
 
                 for key, val in log_row.items():
                     if (
@@ -1313,6 +1334,7 @@ def train_ppo(
                         and key not in ("update", "global_step")
                     ):
                         writer.add_scalar(f"ppo/{key}", val, global_step)
+                tracker.log_metrics("ppo", log_row, step=global_step)
                 with metrics_path.open("a") as f:
                     f.write(json.dumps(log_row) + "\n")
                 last_log = log_row
@@ -1336,7 +1358,7 @@ def train_ppo(
             if not (out_dir / "best_actor.pt").exists():
                 agent.actor.save_actor(out_dir / "best_actor.pt")
     except FloatingPointError as exc:
-        _write_ppo_summary(
+        summary = _write_ppo_summary(
             out_dir,
             global_step=global_step,
             total_timesteps=ppo_cfg.total_timesteps,
@@ -1345,14 +1367,17 @@ def train_ppo(
             last_log=last_log,
             nan_inf_detected=True,
             nan_inf_error=str(exc),
+            wandb_url=tracker.run_url,
         )
+        tracker.update_summary(summary)
+        tracker.finish(exit_code=1)
         raise
     except KeyboardInterrupt:
         _save_latest_ckpt(last_completed_update)
         agent.actor.save_actor(out_dir / "final_actor.pt")
         if not (out_dir / "best_actor.pt").exists():
             agent.actor.save_actor(out_dir / "best_actor.pt")
-        _write_ppo_summary(
+        summary = _write_ppo_summary(
             out_dir,
             global_step=global_step,
             total_timesteps=ppo_cfg.total_timesteps,
@@ -1361,10 +1386,16 @@ def train_ppo(
             last_log=last_log,
             nan_inf_detected=False,
             interrupted=True,
+            wandb_url=tracker.run_url,
         )
+        tracker.update_summary(summary)
+        tracker.finish(exit_code=130)
+        raise
+    except Exception:
+        tracker.finish(exit_code=1)
         raise
 
-    return _write_ppo_summary(
+    summary = _write_ppo_summary(
         out_dir,
         global_step=global_step,
         total_timesteps=ppo_cfg.total_timesteps,
@@ -1372,4 +1403,8 @@ def train_ppo(
         last_eval=last_eval,
         last_log=last_log,
         nan_inf_detected=False,
+        wandb_url=tracker.run_url,
     )
+    tracker.update_summary(summary)
+    tracker.finish(exit_code=0)
+    return summary

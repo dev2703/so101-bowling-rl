@@ -9,6 +9,7 @@ from dataclasses import replace
 
 from so101_bowling.config import load_config
 from so101_bowling.sac import load_sac_config, preflight_sac, train_sac
+from so101_bowling.tracking import WandbConfig, parse_wandb_tags
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -36,6 +37,12 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--preflight", action="store_true", help="Run single-batch overfit & NaN/Inf preflight.")
     parser.add_argument("--preflight-steps", type=int, default=150)
     parser.add_argument("--preflight-batch-size", type=int, default=None)
+    parser.add_argument("--wandb-project", type=str, default=None, help="W&B project name (enables W&B logging).")
+    parser.add_argument("--wandb-entity", type=str, default=None, help="W&B entity/team name.")
+    parser.add_argument("--wandb-run-name", type=str, default=None, help="W&B run display name.")
+    parser.add_argument("--wandb-group", type=str, default=None, help="W&B run group.")
+    parser.add_argument("--wandb-tags", type=str, default=None, help="Comma-separated W&B tags.")
+    parser.add_argument("--wandb-mode", choices=("online", "offline", "disabled"), default="online")
     args = parser.parse_args(argv)
 
     sac_cfg = load_sac_config(args.config)
@@ -79,12 +86,25 @@ def main(argv: list[str] | None = None) -> None:
             sys.exit(1)
         return
 
+    wandb_cfg = (
+        WandbConfig(
+            project=args.wandb_project,
+            entity=args.wandb_entity,
+            run_name=args.wandb_run_name,
+            group=args.wandb_group,
+            tags=parse_wandb_tags(args.wandb_tags),
+            mode=args.wandb_mode,
+        )
+        if args.wandb_project
+        else None
+    )
     summary = train_sac(
         cfg=sac_cfg,
         workspace_cfg=wcfg,
         run_dir=args.out_dir,
         resume_from=args.resume,
         demo_dataset=args.demo_dataset,
+        wandb_cfg=wandb_cfg,
     )
     print(json.dumps(summary, indent=2), flush=True)
 
