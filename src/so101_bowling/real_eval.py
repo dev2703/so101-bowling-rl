@@ -321,20 +321,27 @@ def run_trial_episode(
                     if record.aborted and not getattr(bridge, "estopped", False):
                         estop_result = bridge.emergency_stop(record.abort_reason or "trial_aborted")
                     trace_file.write(json.dumps(row, allow_nan=False) + "\n")
-                    wrist, tripod = trace.wrist_rgb, trace.tripod_rgb
-                    if wrist is not None and tripod is not None:
+                    raw_wrist = getattr(trace, "raw_wrist_rgb", None)
+                    raw_tripod = getattr(trace, "raw_tripod_rgb", None)
+                    if raw_wrist is not None and raw_tripod is not None:
+                        vid_wrist, vid_tripod = raw_wrist, raw_tripod
+                        high_res_video = True
+                    else:
+                        vid_wrist, vid_tripod = trace.wrist_rgb, trace.tripod_rgb
+                        high_res_video = False
+                    if vid_wrist is not None and vid_tripod is not None:
                         if video_size is None:
-                            height, width = wrist.shape[:2]
-                            video_size = (4 * width, 2 * height)
+                            height, width = vid_wrist.shape[:2]
+                            video_size = (2 * width, height) if high_res_video else (4 * width, 2 * height)
                             writer = cv2.VideoWriter(
                                 str(video_path), cv2.VideoWriter_fourcc(*"mp4v"), fps, video_size
                             )
                             if not writer.isOpened():
                                 raise OSError(f"Unable to open video writer for {video_path}")
                         panel_size = (video_size[0] // 2, video_size[1])
-                        pair = np.concatenate(
-                            (cv2.resize(wrist, panel_size), cv2.resize(tripod, panel_size)), axis=1
-                        )
+                        w_panel = vid_wrist if vid_wrist.shape[:2] == (panel_size[1], panel_size[0]) else cv2.resize(vid_wrist, panel_size)
+                        t_panel = vid_tripod if vid_tripod.shape[:2] == (panel_size[1], panel_size[0]) else cv2.resize(vid_tripod, panel_size)
+                        pair = np.concatenate((w_panel, t_panel), axis=1)
                         writer.write(cv2.cvtColor(pair, cv2.COLOR_RGB2BGR))
                         record.video_path = str(video_path)
                     if record.aborted:

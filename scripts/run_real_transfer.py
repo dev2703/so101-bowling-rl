@@ -95,7 +95,19 @@ def _run_trials(args: argparse.Namespace) -> dict:
     calibration_path = str(args.calibration) if args.calibration is not None else hardware.calibration_path
     if args.live and not calibration_path:
         raise SystemExit("run-trials --live requires --calibration or calibration_path in the hardware config")
-    hardware = replace(hardware, dry_run=not args.live, calibration_path=calibration_path)
+    wrist_cam_index = (
+        hardware.wrist_cam_index if args.wrist_index is None else args.wrist_index
+    )
+    tripod_cam_index = (
+        hardware.tripod_cam_index if args.tripod_index is None else args.tripod_index
+    )
+    hardware = replace(
+        hardware,
+        dry_run=not args.live,
+        calibration_path=calibration_path,
+        wrist_cam_index=wrist_cam_index,
+        tripod_cam_index=tripod_cam_index,
+    )
     workspace = load_config(args.workspace_config)
     calibration = load_calibration(live_json_path=hardware.calibration_path)
 
@@ -163,6 +175,8 @@ def main() -> None:
     trials.add_argument("--max-steps", type=_positive_int, default=80)
     trials.add_argument("--calibration", type=Path, help="Path to live LeRobot calibration JSON.")
     trials.add_argument("--live", action="store_true", help="Enable motor commands.")
+    trials.add_argument("--wrist-index", type=int)
+    trials.add_argument("--tripod-index", type=int)
     trials.add_argument("--labeler", default="human_video_review",
                         help="Use operator_cli to enter live outcomes after each recording.")
 

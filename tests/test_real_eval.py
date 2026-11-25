@@ -532,3 +532,70 @@ def test_run_trials_cli_uses_dry_run_default_and_loads_live_calibration(
         assert "CRITICAL WARNING: Live trials stopped" in captured.err
     else:
         assert captured.err == ""
+
+
+def test_run_trial_episode_prefers_raw_frames_for_video(tmp_path):
+    class RawFrameBridge(FakeBridge):
+        def step(self):
+            trace = super().step()
+            trace.raw_wrist_rgb = np.full((24, 32, 3), [255, 0, 0], dtype=np.uint8)
+            trace.raw_tripod_rgb = np.full((24, 32, 3), [0, 0, 255], dtype=np.uint8)
+            return trace
+
+    bridge = RawFrameBridge("alpha", [])
+    record = run_trial_episode(bridge, 2, tmp_path, 1, "alpha", mode="live")
+    assert record.video_path is not None
+    cap = cv2.VideoCapture(record.video_path)
+    try:
+        ok, frame = cap.read()
+        assert ok and frame.shape == (24, 64, 3)
+        assert frame[0, 0, 2] > 240
+        assert frame[0, -1, 0] > 240
+    finally:
+        cap.release()
+
+
+def test_run_trials_cli_camera_index_flags(tmp_path, monkeypatch):
+    from so101_bowling import config, hardware, ppo_models
+
+    opened_indices = []
+    seen_hw_cfgs = []
+
+    class Camera:
+        def __init__(self, device_index, *args, **kwargs):
+            opened_indices.append(device_index)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+        def wait_ready(self):
+            return True
+
+    class Bridge(FakeBridge):
+        def __init__(self, actor, workspace, cal, hw_cfg, wrist, tripod):
+            seen_hw_cfgs.append(hw_cfg)
+            super().__init__("alpha", [])
+
+        def close(self):
+            pass
+
+        def connect_robot(self):
+            pass
+
+        reset = FakeBridge.reset_episode
+
+    monkeypatch.setattr(config, "load_calibration", lambda *, live_json_path: object())
+    monkeypatch.setattr(hardware, "OpenCVTimestampedCamera", Camera)
+    monkeypatch.setattr(hardware, "SO101BowlingHardwareBridge", Bridge)
+    monkeypatch.setattr(ppo_models, "load_actor", lambda path: object())
+
+    _run_cli(
+        monkeypatch, "run-trials", "--checkpoint", "fake.pt", "--policy-name", "alpha",
+        "--out-dir", tmp_path, "--max-steps", 1, "--wrist-index", 3, "--tripod-index", 4,
+    )
+    assert opened_indices == [3, 4]
+    assert seen_hw_cfgs[0].wrist_cam_index == 3
+    assert seen_hw_cfgs[0].tripod_cam_index == 4

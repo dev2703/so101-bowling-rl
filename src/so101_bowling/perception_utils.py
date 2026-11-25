@@ -1,5 +1,6 @@
 """Camera timing and fixed physical scaling for policy observations."""
 
+import math
 from collections import deque
 from dataclasses import dataclass, field
 
@@ -111,7 +112,15 @@ class TimestampedFrameStack:
         return max(0.0, now_t - self._samples[-1][1]) if self._samples else float("inf")
 
     def is_fresh(self, now_t: float, max_age_s: float) -> bool:
-        return self._fresh and self.age_s(now_t) <= max_age_s
+        return self._fresh and self.has_recent_frame(now_t, max_age_s)
+
+    def has_recent_frame(self, now_t: float, max_age_s: float) -> bool:
+        """Return True if at least one frame is stored and within max_age_s."""
+        if not self._samples or not (math.isfinite(now_t) and math.isfinite(max_age_s)):
+            return False
+        if max_age_s < 0.0:
+            return False
+        return 0.0 <= self.age_s(now_t) <= max_age_s
 
 
 class CausalJointVelocityEstimator:
