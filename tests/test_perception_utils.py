@@ -36,6 +36,9 @@ def test_timestamped_stack_accepts_stationary_live_frames_and_rejects_stale_time
     # Repeated capture timestamp stays stale and preserves original age.
     assert not stack.push(frame.copy(), 1.0)
     assert not stack.is_fresh(1.05, 0.2)
+    assert stack.has_recent_frame(1.05, 0.2)
+    assert not stack.has_recent_frame(1.25, 0.2)
+    assert not stack.has_recent_frame(float("nan"), 0.2)
     assert stack.age_s(1.2) == pytest.approx(0.2)
     # Pixel-identical stationary frame with a newer capture timestamp is fresh.
     assert stack.push(frame.copy(), 1.1)

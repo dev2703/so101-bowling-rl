@@ -22,6 +22,7 @@ from so101_bowling.assets import build_scene_xml, get_scene_entity_ids
 from so101_bowling.config import (
     ACTIVE_JOINTS,
     ALL_JOINTS,
+    HELD_JOINTS,
     CalibrationMap,
     WorkspaceConfig,
     hw_to_mjcf_rad,
@@ -50,7 +51,7 @@ class HardwareConfig:
     port: str = "/dev/tty.usbmodem0000"
     calibration_path: str | None = None
     wrist_cam_index: int = 0
-    tripod_cam_index: int = 1
+    tripod_cam_index: int = 2
     cam_width: int = 1280
     cam_height: int = 720
     cam_fps: int = 25
@@ -216,6 +217,9 @@ class OpenCVTimestampedCamera(TimestampedCamera):
         self._thread: threading.Thread | None = None
         self._latest: TimestampedFrame | None = None
         self._seq: int = 0
+        self.negotiated_width: int | None = None
+        self.negotiated_height: int | None = None
+        self.negotiated_fps: float | None = None
 
     def open(self) -> None:
         if self._cap is not None or (self._thread is not None and self._thread.is_alive()):
@@ -229,6 +233,45 @@ class OpenCVTimestampedCamera(TimestampedCamera):
             cap.set(cv2.CAP_PROP_FRAME_HEIGHT, float(self.height))
             cap.set(cv2.CAP_PROP_FPS, float(self.fps))
             cap.set(cv2.CAP_PROP_BUFFERSIZE, 1.0)
+            if callable(getattr(cap, "get", None)):
+                raw_w = float(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                raw_h = float(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                raw_fps = float(cap.get(cv2.CAP_PROP_FPS))
+                self.negotiated_width = int(round(raw_w)) if math.isfinite(raw_w) and raw_w > 0 else None
+                self.negotiated_height = int(round(raw_h)) if math.isfinite(raw_h) and raw_h > 0 else None
+                self.negotiated_fps = raw_fps if math.isfinite(raw_fps) and raw_fps > 0.0 else None
+                _LOGGER.info(
+                    "Opened camera %d: requested=%dx%d@%dfps, negotiated=%sx%s@%sfps",
+                    self.device_index,
+                    self.width,
+                    self.height,
+                    self.fps,
+                    self.negotiated_width,
+                    self.negotiated_height,
+                    f"{self.negotiated_fps:.2f}" if self.negotiated_fps is not None else "unknown",
+                )
+                if (
+                    (self.negotiated_width is not None and self.negotiated_width != self.width)
+                    or (self.negotiated_height is not None and self.negotiated_height != self.height)
+                    or (
+                        self.negotiated_fps is not None
+                        and abs(self.negotiated_fps - float(self.fps)) > 1.0
+                    )
+                ):
+                    _LOGGER.warning(
+                        "Camera %d negotiated %sx%s@%sfps differs from requested %dx%d@%dfps",
+                        self.device_index,
+                        self.negotiated_width,
+                        self.negotiated_height,
+                        f"{self.negotiated_fps:.2f}" if self.negotiated_fps is not None else "unknown",
+                        self.width,
+                        self.height,
+                        self.fps,
+                    )
+            else:
+                self.negotiated_width = None
+                self.negotiated_height = None
+                self.negotiated_fps = None
         except Exception:
             cap.release()
             raise
@@ -613,6 +656,8 @@ class StepTrace:
     wrist_rgb: np.ndarray | None = None
     tripod_rgb: np.ndarray | None = None
     torque_disabled_confirmed: bool | None = None
+    raw_wrist_rgb: np.ndarray | None = None
+    raw_tripod_rgb: np.ndarray | None = None
 
 
 def create_live_follower(hw_cfg: HardwareConfig) -> Any:
@@ -680,6 +725,9 @@ class SO101BowlingHardwareBridge:
         self._home_all_6 = np.asarray(
             [workspace_cfg.robot.home_qpos[j] for j in ALL_JOINTS], dtype=np.float64
         )
+        self._held_home = np.asarray(
+            [workspace_cfg.robot.home_qpos[j] for j in HELD_JOINTS], dtype=np.float64
+        )
         self._prev_applied_delta = np.zeros(len(ACTIVE_JOINTS), dtype=np.float64)
         self._last_sent_active_rad: np.ndarray | None = None
 
@@ -708,8 +756,7 @@ class SO101BowlingHardwareBridge:
         self._wrist_stack.reset()
         self._tripod_stack.reset()
         self._prev_applied_delta = np.zeros(len(ACTIVE_JOINTS), dtype=np.float64)
-        if self.hw_cfg.dry_run:
-            self._last_sent_active_rad = None
+        self._last_sent_active_rad = None
 
     def reset_episode(self) -> None:
         """Alias for reset() to satisfy TrialBridge protocol."""
@@ -847,6 +894,8 @@ class SO101BowlingHardwareBridge:
         tripod_age_s: float = float("inf"),
         wrist_rgb: np.ndarray | None = None,
         tripod_rgb: np.ndarray | None = None,
+        raw_wrist_rgb: np.ndarray | None = None,
+        raw_tripod_rgb: np.ndarray | None = None,
     ) -> StepTrace:
         torque_disabled_confirmed = (
             self.last_estop_result.get("torque_disabled_confirmed")
@@ -870,6 +919,8 @@ class SO101BowlingHardwareBridge:
             wrist_rgb=wrist_rgb,
             tripod_rgb=tripod_rgb,
             torque_disabled_confirmed=torque_disabled_confirmed,
+            raw_wrist_rgb=raw_wrist_rgb,
+            raw_tripod_rgb=raw_tripod_rgb,
         )
 
     def _read_joints_rad(self) -> tuple[float, float, np.ndarray]:
@@ -923,6 +974,8 @@ class SO101BowlingHardwareBridge:
         tripod_age_s = float("inf")
         wrist_proc: np.ndarray | None = None
         tripod_proc: np.ndarray | None = None
+        wrist_raw: np.ndarray | None = None
+        tripod_raw: np.ndarray | None = None
 
         try:
             if self._estopped:
@@ -995,30 +1048,22 @@ class SO101BowlingHardwareBridge:
                 self.emergency_stop("stale_camera_frame")
                 return self._aborted_trace(self._safe_clock(t_end), "stale_camera_frame", q_rad=q_all_6)
 
+            wrist_raw = np.ascontiguousarray(wrist_frame.rgb.copy())
+            tripod_raw = np.ascontiguousarray(tripod_frame.rgb.copy())
             wrist_proc = preprocess_camera_frame(
-                wrist_frame.rgb, out_h=self._render_h, out_w=self._render_w
+                wrist_raw, out_h=self._render_h, out_w=self._render_w
             )
             tripod_proc = preprocess_camera_frame(
-                tripod_frame.rgb, out_h=self._render_h, out_w=self._render_w
+                tripod_raw, out_h=self._render_h, out_w=self._render_w
             )
             self._wrist_stack.push(wrist_proc, wrist_frame.capture_t)
             self._tripod_stack.push(tripod_proc, tripod_frame.capture_t)
 
             wrist_age_s = self._wrist_stack.age_s(now_cam)
             tripod_age_s = self._tripod_stack.age_s(now_cam)
-            wrist_fresh = (
-                math.isfinite(wrist_age_s)
-                and math.isfinite(self.hw_cfg.max_camera_age_s)
-                and 0.0 <= wrist_age_s <= self.hw_cfg.max_camera_age_s
-                and self._wrist_stack.is_fresh(now_cam, self.hw_cfg.max_camera_age_s)
-            )
-            tripod_fresh = (
-                math.isfinite(tripod_age_s)
-                and math.isfinite(self.hw_cfg.max_camera_age_s)
-                and 0.0 <= tripod_age_s <= self.hw_cfg.max_camera_age_s
-                and self._tripod_stack.is_fresh(now_cam, self.hw_cfg.max_camera_age_s)
-            )
-            if not (wrist_fresh and tripod_fresh):
+            wrist_recent = self._wrist_stack.has_recent_frame(now_cam, self.hw_cfg.max_camera_age_s)
+            tripod_recent = self._tripod_stack.has_recent_frame(now_cam, self.hw_cfg.max_camera_age_s)
+            if not (wrist_recent and tripod_recent):
                 self.emergency_stop("stale_camera_frame")
                 return self._aborted_trace(
                     now_cam,
@@ -1028,7 +1073,11 @@ class SO101BowlingHardwareBridge:
                     tripod_age_s=tripod_age_s,
                     wrist_rgb=wrist_proc,
                     tripod_rgb=tripod_proc,
+                    raw_wrist_rgb=wrist_raw,
+                    raw_tripod_rgb=tripod_raw,
                 )
+            wrist_fresh = self._wrist_stack.is_fresh(now_cam, self.hw_cfg.max_camera_age_s)
+            tripod_fresh = self._tripod_stack.is_fresh(now_cam, self.hw_cfg.max_camera_age_s)
 
             obs = {
                 "wrist_rgb": self._stack_frames(self._wrist_stack, self._frame_stack),
@@ -1150,13 +1199,37 @@ class SO101BowlingHardwareBridge:
                 )
 
             applied_delta = np.zeros(len(ACTIVE_JOINTS), dtype=np.float64)
-            if guard.allowed and not self.hw_cfg.dry_run:
+            if guard.allowed:
+                target_active_4 = guard.target_active_4_rad
+            else:
+                safe_hold_ok, safe_hold_reason, _, _ = self.safety_guard.check_pose(q_all_6)
+                if not safe_hold_ok:
+                    reason = f"unsafe_measured_pose:{safe_hold_reason}"
+                    self.emergency_stop(reason)
+                    return self._aborted_trace(
+                        self._safe_clock(now_pre_write),
+                        reason,
+                        q_rad=q_all_6,
+                        action=action,
+                        guard_reason=guard.reason,
+                        wrist_age_s=wrist_age_pre,
+                        tripod_age_s=tripod_age_pre,
+                        wrist_rgb=wrist_proc,
+                        tripod_rgb=tripod_proc,
+                        raw_wrist_rgb=wrist_raw,
+                        raw_tripod_rgb=tripod_raw,
+                    )
+                target_active_4 = q_active
+
+            if not self.hw_cfg.dry_run:
                 assert self.robot is not None
                 self._validate_active_joint_norm_modes()
                 cmd = {
-                    f"{j}.pos": mjcf_rad_to_hw(j, float(guard.target_active_4_rad[i]), self.cal)
+                    f"{j}.pos": mjcf_rad_to_hw(j, float(target_active_4[i]), self.cal)
                     for i, j in enumerate(ACTIVE_JOINTS)
                 }
+                for i, j in enumerate(HELD_JOINTS):
+                    cmd[f"{j}.pos"] = mjcf_rad_to_hw(j, float(self._held_home[i]), self.cal)
                 try:
                     sent = self.robot.send_action(cmd)
                     sent_rad = np.asarray(
@@ -1181,6 +1254,8 @@ class SO101BowlingHardwareBridge:
                         tripod_age_s=tripod_age_pre,
                         wrist_rgb=wrist_proc,
                         tripod_rgb=tripod_proc,
+                        raw_wrist_rgb=wrist_raw,
+                        raw_tripod_rgb=tripod_raw,
                     )
                 self._last_sent_active_rad = sent_rad.copy()
                 applied_delta = sent_rad - q_active
@@ -1199,6 +1274,8 @@ class SO101BowlingHardwareBridge:
                 wrist_rgb=wrist_proc,
                 tripod_rgb=tripod_proc,
                 torque_disabled_confirmed=None,
+                raw_wrist_rgb=wrist_raw,
+                raw_tripod_rgb=tripod_raw,
             )
         except Exception as exc:
             reason = f"step_exception:{type(exc).__name__}"
@@ -1216,4 +1293,6 @@ class SO101BowlingHardwareBridge:
                 tripod_age_s=tripod_age_s,
                 wrist_rgb=wrist_proc,
                 tripod_rgb=tripod_proc,
+                raw_wrist_rgb=wrist_raw,
+                raw_tripod_rgb=tripod_raw,
             )

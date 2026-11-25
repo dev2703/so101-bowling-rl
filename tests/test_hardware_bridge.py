@@ -20,6 +20,7 @@ import pytest
 from so101_bowling.config import (
     ACTIVE_JOINTS,
     ALL_JOINTS,
+    HELD_JOINTS,
     hw_to_mjcf_rad,
     load_calibration,
     load_config,
@@ -207,6 +208,8 @@ def test_hardware_config_defaults_and_lerobot_lazy_import() -> None:
     hw_cfg = load_hardware_config()
     assert hw_cfg.dry_run is True
     assert hw_cfg.port == "/dev/tty.usbmodem0000"
+    assert hw_cfg.wrist_cam_index == 0
+    assert hw_cfg.tripod_cam_index == 2
     assert hw_cfg.wrist_rotation_deg == 180
     assert hw_cfg.tripod_rotation_deg == 0
     assert hw_cfg.z_floor_margin_m == pytest.approx(0.015)
@@ -434,9 +437,11 @@ def test_active_4_command_conversion_validation_and_proprio_parity() -> None:
     assert trace1.torque_disabled_confirmed is None
     assert len(spy.sent_commands) == 1
     cmd = spy.sent_commands[0]
-    assert set(cmd.keys()) == {f"{j}.pos" for j in ACTIVE_JOINTS}
-    assert "gripper.pos" not in cmd
-    assert "wrist_roll.pos" not in cmd
+    assert set(cmd.keys()) == {f"{j}.pos" for j in ALL_JOINTS}
+    for j in HELD_JOINTS:
+        assert cmd[f"{j}.pos"] == pytest.approx(
+            mjcf_rad_to_hw(j, wcfg.robot.home_qpos[j], cal)
+        )
 
     # Verify degrees conversion (no double homing_offset) and prev_applied_delta parity.
     expected_target = q_before + np.array([0.5, 0.25, -0.25, 0.1]) * wcfg.robot.max_action_rad
@@ -496,14 +501,24 @@ def test_static_scene_freshness_stalled_camera_and_inference_overrun_abort() -> 
         assert not trace.aborted
     assert len(spy.sent_commands) == 3
 
-    # Stalled single camera (tripod keeps same capture_t) triggers latched E-stop abort.
+    # Repeated camera frame within max_camera_age_s emits fresh=0.0 without latching E-stop.
     wrist_cam.frame = TimestampedFrame(static_rgb.copy(), capture_t=clock.t, frame_seq=4)
     clock.advance(0.03)
+    repeated_trace = bridge.step()
+    assert not repeated_trace.aborted
+    assert not bridge.estopped
+    assert len(spy.sent_commands) == 4
+    assert actor.seen_obs[-1]["camera_meta"][1] == pytest.approx(1.0)
+    assert actor.seen_obs[-1]["camera_meta"][3] == pytest.approx(0.0)
+
+    # Stalled single camera past max_camera_age_s triggers latched E-stop abort.
+    wrist_cam.frame = TimestampedFrame(static_rgb.copy(), capture_t=clock.t, frame_seq=5)
+    clock.advance(0.20)
     stalled_trace = bridge.step()
     assert stalled_trace.aborted
     assert stalled_trace.abort_reason == "stale_camera_frame"
     assert bridge.estopped
-    assert len(spy.sent_commands) == 3
+    assert len(spy.sent_commands) == 4
 
     # Inference overrun triggers pre-write staleness abort with ZERO bus writes.
     spy_overrun = SpyRobot(cal=cal, q_rad=wcfg.robot.home_qpos)
@@ -894,8 +909,7 @@ def test_guard_out_of_limit_clamping_and_last_sent_lag_corners() -> None:
     sent_after_t2 = bridge._last_sent_active_rad.copy()
 
     bridge.reset_episode()
-    assert bridge._last_sent_active_rad is not None
-    np.testing.assert_allclose(bridge._last_sent_active_rad, sent_after_t2)
+    assert bridge._last_sent_active_rad is None
     bridge.close()
     assert bridge._last_sent_active_rad is None
 
@@ -1430,6 +1444,99 @@ def test_mutated_nan_threshold_fails_closed_in_guard_and_live_step() -> None:
     assert bridge.estopped is True
     assert spy.get_observation_calls == 0
     assert spy.sent_commands == []
+
+
+def test_safe_hold_on_lag_corner_reject_and_negotiated_camera_logging(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    wcfg = load_config()
+    cal = load_calibration()
+    hw_cfg = HardwareConfig(dry_run=False, calibration_path="/tmp/aligned_follower.json")
+
+    # 1. On lag-corner rejection (safe measured pose, unsafe in-flight target), live bridge
+    # must command a safe hold at q_active (plus held joints) rather than dropping send_action().
+    q_safe_start = {
+        "shoulder_pan": 0.0,
+        "shoulder_lift": 0.42,
+        "elbow_flex": -0.80,
+        "wrist_flex": 0.0,
+        "wrist_roll": wcfg.robot.home_qpos["wrist_roll"],
+        "gripper": wcfg.robot.home_qpos["gripper"],
+    }
+
+    class LaggySpyRobot(SpyRobot):
+        def send_action(self, action: dict[str, float]) -> dict[str, float]:
+            # Record command and echo sent target without advancing physical q_rad yet.
+            self.sent_commands.append(dict(action))
+            return {k: float(v) for k, v in action.items()}
+
+    clock = FakeClock(initial_t=10.0, auto_step=0.002)
+    laggy = LaggySpyRobot(cal=cal, q_rad=q_safe_start)
+    wrist_cam = MockCamera(TimestampedFrame(_make_rgb(), capture_t=clock.t, frame_seq=1))
+    tripod_cam = MockCamera(TimestampedFrame(_make_rgb(), capture_t=clock.t, frame_seq=1))
+    # Simulate an in-flight _last_sent_active_rad = [0.0, 0.50, -0.80, 0.0] while robot stays at 0.40;
+    # reversal is rejected on the 16-corner lag check and must command a safe hold at 0.40.
+    bridge = SO101BowlingHardwareBridge(
+        actor=ScriptedActor(action=np.array([0.0, -0.5, 0.0, 0.0], dtype=np.float32)),
+        workspace_cfg=wcfg,
+        cal=cal,
+        hw_cfg=hw_cfg,
+        wrist_cam=wrist_cam,
+        tripod_cam=tripod_cam,
+        robot=laggy,
+        clock=clock,
+    )
+    bridge.connect_robot()
+    laggy.q_rad["shoulder_lift"] = 0.40
+    bridge._last_sent_active_rad = np.array([0.0, 0.50, -0.80, 0.0], dtype=np.float64)
+
+    trace_hold = bridge.step()
+    assert trace_hold.aborted is False
+    assert trace_hold.guard_reason == "foul_line_violation"
+    assert len(laggy.sent_commands) == 1
+    cmd = laggy.sent_commands[0]
+    assert set(cmd.keys()) == {f"{j}.pos" for j in ALL_JOINTS}
+    assert cmd["shoulder_lift.pos"] == pytest.approx(mjcf_rad_to_hw("shoulder_lift", 0.40, cal))
+    for j in HELD_JOINTS:
+        assert cmd[f"{j}.pos"] == pytest.approx(mjcf_rad_to_hw(j, wcfg.robot.home_qpos[j], cal))
+    assert bridge._last_sent_active_rad is not None
+    assert bridge._last_sent_active_rad[1] == pytest.approx(0.40)
+
+    # 2. Negotiated resolution/FPS mismatch is recorded and logged on OpenCVTimestampedCamera.open().
+    class MismatchedCapture:
+        def __init__(self, _idx: int) -> None:
+            self._open = True
+
+        def isOpened(self) -> bool:
+            return self._open
+
+        def set(self, _prop: int, _val: float) -> bool:
+            return True
+
+        def get(self, prop: int) -> float:
+            if prop == cv2.CAP_PROP_FRAME_WIDTH:
+                return 640.0
+            if prop == cv2.CAP_PROP_FRAME_HEIGHT:
+                return 480.0
+            if prop == cv2.CAP_PROP_FPS:
+                return 30.0
+            return 0.0
+
+        def read(self) -> tuple[bool, np.ndarray]:
+            return True, np.zeros((480, 640, 3), dtype=np.uint8)
+
+        def release(self) -> None:
+            self._open = False
+
+    with caplog.at_level("INFO", logger="so101_bowling.hardware"):
+        with OpenCVTimestampedCamera(
+            0, width=1280, height=720, fps=25, rotation_deg=0, capture_factory=MismatchedCapture
+        ) as cam:
+            assert cam.wait_ready(timeout_s=1.0)
+            assert cam.negotiated_width == 640
+            assert cam.negotiated_height == 480
+            assert cam.negotiated_fps == pytest.approx(30.0)
+    assert any("negotiated 640x480@30.00fps differs" in rec.message for rec in caplog.records)
 
 
 @pytest.mark.hardware
