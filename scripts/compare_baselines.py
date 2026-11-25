@@ -11,7 +11,7 @@ import numpy as np
 
 from so101_bowling.config import WorkspaceConfig, load_config
 from so101_bowling.env import SO101BowlingEnv
-from so101_bowling.hub import _ACTOR_CANDIDATES
+from so101_bowling.hub import load_training_metrics, resolve_actor_checkpoint
 from so101_bowling.kinematics import ScriptedPushController
 from so101_bowling.ppo import evaluate_actor, evaluate_camera_ablation, resolve_device
 from so101_bowling.ppo_models import load_actor
@@ -81,42 +81,6 @@ def evaluate_scripted_4dof(
     }
 
 
-def _resolve_baseline_paths(
-    checkpoint_arg: str | None,
-    run_dir_arg: str | None,
-) -> tuple[Path, Path]:
-    if checkpoint_arg is not None:
-        ckpt_path = Path(checkpoint_arg)
-        rdir = Path(run_dir_arg) if run_dir_arg is not None else ckpt_path.parent
-        return ckpt_path, rdir
-    assert run_dir_arg is not None
-    rdir = Path(run_dir_arg)
-    for cand in _ACTOR_CANDIDATES:
-        candidate = rdir / cand
-        if candidate.exists():
-            return candidate, rdir
-    raise FileNotFoundError(
-        f"No actor checkpoint from {_ACTOR_CANDIDATES} found in run directory {rdir}"
-    )
-
-
-def _load_training_metrics(run_dir: Path) -> dict[str, Any] | None:
-    summary_path = run_dir / "summary.json"
-    if not summary_path.exists():
-        return None
-    summary = json.loads(summary_path.read_text(encoding="utf-8"))
-    keys = (
-        "global_step",
-        "total_timesteps",
-        "final_losses",
-        "eval_aux_loss",
-        "nan_inf_detected",
-        "validation_loss_note",
-        "best_eval",
-    )
-    return {k: summary[k] for k in keys if k in summary}
-
-
 def _evaluate_actor_baseline(
     checkpoint_path: str | Path,
     cfg: WorkspaceConfig,
@@ -151,7 +115,7 @@ def _evaluate_actor_baseline(
             seed=seed,
             device=device,
         )
-    training_metrics = _load_training_metrics(run_dir if run_dir is not None else ckpt.parent)
+    training_metrics = load_training_metrics(run_dir if run_dir is not None else ckpt.parent)
     if training_metrics is not None:
         metrics["training_metrics"] = training_metrics
     return metrics
@@ -191,7 +155,7 @@ def main() -> None:
     }
 
     if args.ppo_checkpoint is not None or args.ppo_run_dir is not None:
-        ppo_ckpt, ppo_rdir = _resolve_baseline_paths(args.ppo_checkpoint, args.ppo_run_dir)
+        ppo_ckpt, ppo_rdir = resolve_actor_checkpoint(args.ppo_checkpoint, args.ppo_run_dir)
         report["ppo"] = _evaluate_actor_baseline(
             checkpoint_path=ppo_ckpt,
             cfg=ws_cfg,
@@ -204,7 +168,7 @@ def main() -> None:
         )
 
     if args.sac_checkpoint is not None or args.sac_run_dir is not None:
-        sac_ckpt, sac_rdir = _resolve_baseline_paths(args.sac_checkpoint, args.sac_run_dir)
+        sac_ckpt, sac_rdir = resolve_actor_checkpoint(args.sac_checkpoint, args.sac_run_dir)
         report["sac"] = _evaluate_actor_baseline(
             checkpoint_path=sac_ckpt,
             cfg=ws_cfg,

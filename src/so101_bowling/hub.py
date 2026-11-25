@@ -115,20 +115,65 @@ def build_model_card(
             ]
         )
 
-    default_filename = "actor_best.pt" if algo == "sac" else "best_actor.pt"
+    default_filename = (
+        "actor_best.pt"
+        if algo in ("sac", "dagger")
+        else "best_teacher.pt"
+        if algo == "teacher"
+        else "best_actor.pt"
+    )
     lines.extend(
         [
             "## Usage",
             "",
             "```python",
             "from so101_bowling.hub import load_actor_from_hub",
-            f'actor = load_actor_from_hub("{repo_id}")  # auto-detects actor_best.pt (SAC) / best_actor.pt (PPO)',
+            f'actor = load_actor_from_hub("{repo_id}")  # auto-detects actor_best.pt (SAC/DAgger) / best_actor.pt (PPO)',
             f'# Or explicitly: load_actor_from_hub("{repo_id}", filename="{default_filename}")',
             "```",
             "",
         ]
     )
     return "\n".join(lines)
+
+
+def resolve_actor_checkpoint(
+    checkpoint: str | Path | None,
+    run_dir: str | Path | None,
+) -> tuple[Path, Path]:
+    """Resolve an exported actor checkpoint path and its owning run directory."""
+    if checkpoint is not None:
+        ckpt_path = Path(checkpoint)
+        rdir = Path(run_dir) if run_dir is not None else ckpt_path.parent
+        return ckpt_path, rdir
+    if run_dir is None:
+        raise ValueError("Either checkpoint or run_dir must be provided")
+    rdir = Path(run_dir)
+    for cand in _ACTOR_CANDIDATES:
+        candidate_path = rdir / cand
+        if candidate_path.exists():
+            return candidate_path, rdir
+    raise FileNotFoundError(
+        f"No actor checkpoint from {_ACTOR_CANDIDATES} found in run directory {rdir}"
+    )
+
+
+def load_training_metrics(run_dir: str | Path) -> dict[str, Any] | None:
+    """Load summary training metrics from ``run_dir/summary.json`` if present."""
+    summary_path = Path(run_dir) / "summary.json"
+    if not summary_path.exists():
+        return None
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    keys = (
+        "global_step",
+        "total_timesteps",
+        "final_losses",
+        "eval_aux_loss",
+        "nan_inf_detected",
+        "validation_loss_note",
+        "best_eval",
+    )
+    return {k: summary[k] for k in keys if k in summary}
 
 
 def build_dataset_card(repo_id: str, info: dict[str, Any]) -> str:

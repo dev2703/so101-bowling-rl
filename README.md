@@ -32,13 +32,26 @@ On headless Linux (CI / Colab), set `MUJOCO_GL=egl` (GPU) or `MUJOCO_GL=osmesa` 
 ## Training & Evaluation
 
 ```bash
-# Train Asymmetric PPO
+# Run single-batch overfit & NaN/Inf preflight before full training
+uv run python scripts/train_ppo.py --config configs/ppo_dr.yaml --preflight
+uv run python scripts/train_sac.py --config configs/sac_dr.yaml --preflight
+
+# Train Asymmetric PPO (nominal or domain-randomized)
 uv run python scripts/train_ppo.py --config configs/ppo.yaml --run-dir runs/ppo
+uv run python scripts/train_ppo.py --config configs/ppo_dr.yaml --run-dir runs/ppo_dr
 
-# Train Asymmetric SAC
+# Train Asymmetric SAC (nominal or domain-randomized)
 uv run python scripts/train_sac.py --config configs/sac.yaml --out-dir runs/sac
+uv run python scripts/train_sac.py --config configs/sac_dr.yaml --out-dir runs/sac_dr
 
-# Evaluate a standalone exported actor (PPO or SAC)
+# Teacher-Student pipeline: Stage 1 Privileged PPO Teacher -> Stage 2 Online DAgger
+uv run python scripts/colab_train.py \
+  --algo teacher --config configs/teacher_dr.yaml --run-dir runs/teacher_dr --mujoco-gl ""
+uv run python scripts/colab_train.py \
+  --algo dagger --config configs/dagger_dr.yaml \
+  --teacher-checkpoint runs/teacher_dr/best_teacher.pt --run-dir runs/dagger_dr
+
+# Evaluate a standalone exported actor (PPO, SAC, or DAgger)
 uv run python scripts/eval_ppo.py --checkpoint runs/sac/actor_best.pt --episodes 20 --ablate-cameras
 
 # Paired-seed comparison: scripted 4-DOF vs PPO vs SAC

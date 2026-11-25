@@ -9,7 +9,6 @@ import os
 import re
 import shlex
 import subprocess
-import sys
 import tempfile
 from pathlib import Path
 from typing import Any

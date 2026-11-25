@@ -4,47 +4,12 @@ from __future__ import annotations
 
 import argparse
 import json
-from pathlib import Path
 from typing import Any
 
 from so101_bowling.config import load_config
-from so101_bowling.hub import _ACTOR_CANDIDATES
+from so101_bowling.hub import load_training_metrics, resolve_actor_checkpoint
 from so101_bowling.ppo import evaluate_actor, evaluate_camera_ablation, resolve_device
 from so101_bowling.ppo_models import load_actor
-
-
-def _resolve_checkpoint_path(checkpoint: str | None, run_dir: str | None) -> tuple[Path, Path]:
-    if checkpoint is not None:
-        ckpt_path = Path(checkpoint)
-        rdir = Path(run_dir) if run_dir is not None else ckpt_path.parent
-        return ckpt_path, rdir
-    if run_dir is None:
-        raise ValueError("Either --checkpoint or --run-dir must be provided")
-    rdir = Path(run_dir)
-    for cand in _ACTOR_CANDIDATES:
-        candidate_path = rdir / cand
-        if candidate_path.exists():
-            return candidate_path, rdir
-    raise FileNotFoundError(
-        f"No actor checkpoint from {_ACTOR_CANDIDATES} found in run directory {rdir}"
-    )
-
-
-def _load_training_metrics(run_dir: Path) -> dict[str, Any] | None:
-    summary_path = run_dir / "summary.json"
-    if not summary_path.exists():
-        return None
-    summary = json.loads(summary_path.read_text(encoding="utf-8"))
-    keys = (
-        "global_step",
-        "total_timesteps",
-        "final_losses",
-        "eval_aux_loss",
-        "nan_inf_detected",
-        "validation_loss_note",
-        "best_eval",
-    )
-    return {k: summary[k] for k in keys if k in summary}
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -68,7 +33,7 @@ def main(argv: list[str] | None = None) -> None:
     if args.checkpoint is None and args.run_dir is None:
         parser.error("Provide --checkpoint or --run-dir")
 
-    ckpt_path, run_dir = _resolve_checkpoint_path(args.checkpoint, args.run_dir)
+    ckpt_path, run_dir = resolve_actor_checkpoint(args.checkpoint, args.run_dir)
     wcfg = load_config(args.workspace_config)
     device = resolve_device(args.device)
     actor = load_actor(ckpt_path, map_location=device)
@@ -109,7 +74,7 @@ def main(argv: list[str] | None = None) -> None:
             video_path=args.video_out,
         )
 
-    training_metrics = _load_training_metrics(run_dir)
+    training_metrics = load_training_metrics(run_dir)
     if training_metrics is not None:
         results["training_metrics"] = training_metrics
 

@@ -17,6 +17,7 @@ import torch
 import torch.nn.functional as F
 import yaml
 from torch import Tensor, nn
+from torch.distributions import Normal, kl_divergence
 from torch.utils.tensorboard import SummaryWriter
 
 from so101_bowling.config import WorkspaceConfig, load_config
@@ -60,13 +61,38 @@ def _assert_finite_tensor(name: str, t: Tensor) -> None:
 
 
 def _assert_finite_mapping(prefix: str, items: Mapping[str, float | Tensor]) -> None:
+    tensors: list[tuple[str, Tensor]] = []
     for key, val in items.items():
-        full_name = f"{prefix}.{key}"
         if isinstance(val, Tensor):
-            _assert_finite_tensor(full_name, val)
+            tensors.append((f"{prefix}.{key}", val))
         elif isinstance(val, (int, float)) and not isinstance(val, bool):
             if not math.isfinite(float(val)):
-                raise FloatingPointError(f"Non-finite scalar {full_name}: {val}")
+                raise FloatingPointError(f"Non-finite scalar {prefix}.{key}: {val}")
+    if not tensors:
+        return
+    if len(tensors) == 1:
+        _assert_finite_tensor(*tensors[0])
+        return
+    by_device: dict[torch.device, list[tuple[str, Tensor]]] = {}
+    for full_name, t in tensors:
+        by_device.setdefault(t.device, []).append((full_name, t))
+    for group in by_device.values():
+        if bool(torch.stack([torch.isfinite(t).all() for _, t in group]).all()):
+            continue
+        for full_name, t in group:
+            _assert_finite_tensor(full_name, t)
+
+
+def _assert_finite_params(prefix: str, params: Iterable[nn.Parameter]) -> None:
+    by_device: dict[torch.device, list[Tensor]] = {}
+    for p in params:
+        if p.data.numel() > 0:
+            by_device.setdefault(p.data.device, []).append(p.data)
+    for group in by_device.values():
+        if bool(torch.stack([torch.isfinite(t).all() for t in group]).all()):
+            continue
+        for idx, t in enumerate(group):
+            _assert_finite_tensor(f"{prefix}.param[{idx}]", t)
 
 
 def _module_grad_and_param_stats(params: Iterable[nn.Parameter]) -> tuple[float, float]:
@@ -566,22 +592,6 @@ def _explained_variance(y_pred: Tensor, y_true: Tensor) -> float:
     return float(1.0 - torch.var(y_true - y_pred) / var_y)
 
 
-def _validate_ppo_config(cfg: PPOConfig) -> None:
-    for name in (
-        "num_envs",
-        "rollout_steps",
-        "total_timesteps",
-        "minibatch_size",
-        "eval_interval_updates",
-        "checkpoint_interval_updates",
-        "frame_stack",
-    ):
-        if getattr(cfg, name) <= 0:
-            raise ValueError(f"{name} must be positive")
-    if cfg.drq_pad_px < 0:
-        raise ValueError("drq_pad_px must be nonnegative")
-
-
 def _extract_ppo_final_losses(last_log: Mapping[str, Any]) -> dict[str, float]:
     keys = ("policy_loss", "value_loss", "aux_loss", "entropy", "approx_kl", "post_update_kl")
     return {
@@ -637,7 +647,6 @@ def preflight_ppo(
     batch_size: int | None = None,
 ) -> dict[str, Any]:
     """Run deterministic single-batch overfit and numerical stability verification for Asymmetric PPO."""
-    _validate_ppo_config(ppo_cfg)
     if steps <= 0:
         raise ValueError("steps must be positive")
     wcfg = workspace_cfg if workspace_cfg is not None else load_config()
@@ -920,7 +929,6 @@ def train_ppo(
     wandb_cfg: WandbConfig | None = None,
 ) -> dict[str, Any]:
     """Train DualCameraActor + AsymmetricPPOAgent and export standalone actor checkpoints."""
-    _validate_ppo_config(ppo_cfg)
     wcfg = workspace_cfg if workspace_cfg is not None else load_config()
     out_dir = Path(run_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -1054,27 +1062,13 @@ def train_ppo(
                     optimizer.param_groups[0]["lr"] = frac * ppo_cfg.lr
 
                 agent.eval()
+                zero_shifts = torch.zeros((ppo_cfg.num_envs, 2), dtype=torch.long)
                 for step in range(ppo_cfg.rollout_steps):
                     global_step += ppo_cfg.num_envs
-                    pad = ppo_cfg.drq_pad_px
-                    if pad > 0:
-                        w_shift = torch.from_numpy(
-                            rng.integers(-pad, pad + 1, size=(ppo_cfg.num_envs, 2), dtype=np.int64)
-                        )
-                        t_shift = torch.from_numpy(
-                            rng.integers(-pad, pad + 1, size=(ppo_cfg.num_envs, 2), dtype=np.int64)
-                        )
-                    else:
-                        w_shift = torch.zeros((ppo_cfg.num_envs, 2), dtype=torch.long)
-                        t_shift = torch.zeros((ppo_cfg.num_envs, 2), dtype=torch.long)
 
                     with torch.no_grad():
                         obs_t = _obs_to_device(next_obs, device)
-                        action, logprob, _, value, _ = agent.get_action_and_value(
-                            obs_t,
-                            wrist_shifts=w_shift.to(device),
-                            tripod_shifts=t_shift.to(device),
-                        )
+                        action, logprob, _, value, _ = agent.get_action_and_value(obs_t)
 
                     _assert_finite_mapping(
                         f"ppo.rollout.step_{global_step}",
@@ -1111,8 +1105,8 @@ def train_ppo(
                         terminated=terminated,
                         truncated=truncated,
                         final_value=final_values,
-                        wrist_shift=w_shift,
-                        tripod_shift=t_shift,
+                        wrist_shift=zero_shifts,
+                        tripod_shift=zero_shifts,
                     )
                     next_obs = new_obs
 
@@ -1144,6 +1138,7 @@ def train_ppo(
                 pre_kls: list[float] = []
 
                 stop_early = False
+                pad = ppo_cfg.drq_pad_px
                 for _ in range(ppo_cfg.num_epochs):
                     perm = rng.permutation(batch_size)
                     for start in range(0, batch_size, minibatch_size):
@@ -1155,16 +1150,34 @@ def train_ppo(
                             mb_adv,
                             mb_ret,
                             _,
-                            mb_w_shift,
-                            mb_t_shift,
+                            _,
+                            _,
                         ) = _batch_slice(flat, mb_inds, device)
 
-                        _, newlogp, entropy, newvalue, aux_pred = agent.get_action_and_value(
-                            mb_obs,
-                            wrist_shifts=mb_w_shift,
-                            tripod_shifts=mb_t_shift,
-                            action=mb_act,
-                        )
+                        dist, z_vis = agent.actor.forward_actor(mb_obs)
+                        newlogp = dist.log_prob(mb_act).sum(dim=-1)
+                        entropy = dist.entropy().sum(dim=-1)
+                        newvalue = agent.get_value(mb_obs)
+
+                        # Keep DrQ shifts strictly in the update pass (aux + DrAC policy invariance)
+                        # so rollout actions and PPO importance ratios remain exact.
+                        if pad > 0:
+                            mb_w_shift = torch.from_numpy(
+                                rng.integers(-pad, pad + 1, size=(len(mb_inds), 2), dtype=np.int64)
+                            ).to(device)
+                            mb_t_shift = torch.from_numpy(
+                                rng.integers(-pad, pad + 1, size=(len(mb_inds), 2), dtype=np.int64)
+                            ).to(device)
+                            dist_aug, z_vis_aug = agent.actor.forward_actor(
+                                mb_obs, wrist_shifts=mb_w_shift, tripod_shifts=mb_t_shift
+                            )
+                            aux_pred = agent.aux_head(z_vis_aug)
+                            ref_dist = Normal(dist.mean.detach(), dist.stddev.detach())
+                            drac_loss = kl_divergence(ref_dist, dist_aug).sum(dim=-1).mean()
+                        else:
+                            aux_pred = agent.aux_head(z_vis)
+                            drac_loss = torch.zeros((), device=device, dtype=newlogp.dtype)
+
                         logratio = newlogp - mb_logp
                         ratio = logratio.exp()
 
@@ -1193,6 +1206,7 @@ def train_ppo(
                             + ppo_cfg.vf_coef * v_loss
                             - ppo_cfg.ent_coef * ent_loss
                             + ppo_cfg.aux_coef * aux_loss
+                            + 0.1 * drac_loss
                         )
                         _assert_finite_mapping(
                             f"ppo.update_{update}",
@@ -1206,6 +1220,7 @@ def train_ppo(
                                 "value_loss": v_loss,
                                 "ent_loss": ent_loss,
                                 "aux_loss": aux_loss,
+                                "drac_loss": drac_loss,
                                 "loss": loss,
                             },
                         )
@@ -1214,9 +1229,8 @@ def train_ppo(
                         loss.backward()
                         grad_norm = nn.utils.clip_grad_norm_(agent.parameters(), ppo_cfg.max_grad_norm)
                         _assert_finite_tensor(f"ppo.update_{update}.grad_norm", grad_norm)
-                        _module_grad_and_param_stats(agent.parameters())
                         optimizer.step()
-                        _module_grad_and_param_stats(agent.parameters())
+                        _assert_finite_params(f"ppo.update_{update}", agent.parameters())
 
                         pg_losses.append(float(pg_loss.detach().cpu()))
                         v_losses.append(float(v_loss.detach().cpu()))
@@ -1234,13 +1248,11 @@ def train_ppo(
                 with torch.no_grad():
                     for start in range(0, batch_size, minibatch_size):
                         mb_inds = slice(start, min(start + minibatch_size, batch_size))
-                        mb_obs, mb_act, mb_logp, _, _, _, mb_w_shift, mb_t_shift = _batch_slice(
+                        mb_obs, mb_act, mb_logp, _, _, _, _, _ = _batch_slice(
                             flat, mb_inds, device
                         )
                         _, post_logp, _, _, _ = agent.get_action_and_value(
                             mb_obs,
-                            wrist_shifts=mb_w_shift,
-                            tripod_shifts=mb_t_shift,
                             action=mb_act,
                         )
                         lr_diff = post_logp - mb_logp

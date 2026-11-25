@@ -249,3 +249,37 @@ def test_real_env_integration_with_dr_camera_drops():
                     np.testing.assert_array_equal(batch["obs"][key][row], original_obs[key][0])
                     np.testing.assert_array_equal(batch["next_obs"][key][row], original_successor[key])
     assert repeated_after_delivery.all()
+
+
+def test_cached_valid_indices_invalidates_only_on_add(monkeypatch: pytest.MonkeyPatch):
+    buf = RawFrameReplayBuffer(8, 2, img_hw=_HW)
+    obs0 = _obs([(1, 1), (2, 2)])
+    obs1 = _obs([(3, 3), (4, 4)])
+    _add(buf, obs0, obs1, 0)
+
+    calls = 0
+    orig_valid_mask = buf._valid_mask
+
+    def counting_valid_mask():
+        nonlocal calls
+        calls += 1
+        return orig_valid_mask()
+
+    monkeypatch.setattr(buf, "_valid_mask", counting_valid_mask)
+    assert len(buf) == 2
+    assert buf.valid_size == 2
+    buf.sample(2, rng=np.random.default_rng(0))
+    buf.sample(2, rng=np.random.default_rng(1))
+    assert calls == 1
+
+    # Failed add() must leave cached indices intact.
+    with pytest.raises(ValueError, match="proprio"):
+        _add(buf, obs1, {**obs0, "proprio": obs0["proprio"][:1]}, 1)
+    assert len(buf) == 2
+    assert calls == 1
+
+    # Valid add() invalidates cache; next access recomputes once.
+    _add(buf, obs1, _obs([(5, 5), (6, 6)]), 1)
+    assert len(buf) == 4
+    buf.sample(4, rng=np.random.default_rng(2))
+    assert calls == 2

@@ -507,3 +507,75 @@ def test_evaluate_actor_steps_eval_aux_and_eval_ppo_cli(tmp_path: Path) -> None:
     assert "training_metrics" in eval_out
     assert eval_out["training_metrics"]["nan_inf_detected"] is False
     assert "final_losses" in eval_out["training_metrics"]
+
+
+def test_train_ppo_does_not_apply_drq_shifts_during_rollout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from so101_bowling.ppo_models import AsymmetricPPOAgent
+
+    rollout_shifts: list[tuple[object, object]] = []
+    orig_get_action = AsymmetricPPOAgent.get_action_and_value
+
+    def spy_get_action(self, obs, wrist_shifts=None, tripod_shifts=None, action=None):
+        if action is None:
+            rollout_shifts.append((wrist_shifts, tripod_shifts))
+        return orig_get_action(
+            self, obs, wrist_shifts=wrist_shifts, tripod_shifts=tripod_shifts, action=action
+        )
+
+    monkeypatch.setattr(AsymmetricPPOAgent, "get_action_and_value", spy_get_action)
+    monkeypatch.setattr(
+        ppo,
+        "evaluate_actor",
+        lambda **kw: {
+            "episodes": 1,
+            "legal_strike_rate": 0.0,
+            "mean_credited_pins": 0.0,
+            "mean_full_knock_pins": 0.0,
+            "mean_wobble_only_pins": 0.0,
+            "illegal_rate": 1.0,
+            "mean_return": 0.0,
+            "mean_episode_steps": 10.0,
+            "eval_aux_loss": 0.1,
+        },
+    )
+    train_ppo(
+        PPOConfig(
+            num_envs=1,
+            rollout_steps=4,
+            total_timesteps=4,
+            minibatch_size=2,
+            num_epochs=1,
+            drq_pad_px=4,
+            eval_interval_updates=1,
+            checkpoint_interval_updates=1,
+            eval_episodes=1,
+            save_video=False,
+            device="cpu",
+        ),
+        workspace_cfg=load_config(),
+        run_dir=tmp_path / "ppo_no_rollout_shift",
+    )
+    assert len(rollout_shifts) == 4
+    assert all(w is None and t is None for w, t in rollout_shifts)
+
+
+def test_package_exports_teacher_dagger_and_tracking_lazily() -> None:
+    import so101_bowling
+
+    for name in (
+        "TeacherPPOConfig",
+        "load_teacher_config",
+        "PrivilegedTeacherAgent",
+        "load_teacher",
+        "train_teacher_ppo",
+        "DAggerConfig",
+        "load_dagger_config",
+        "train_dagger",
+        "WandbConfig",
+        "WandbTracker",
+        "parse_wandb_tags",
+    ):
+        assert name in so101_bowling.__all__
+        assert hasattr(so101_bowling, name)
