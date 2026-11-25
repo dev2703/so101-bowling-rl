@@ -106,7 +106,7 @@ class TableConfig:
         0.0008,
         0.0008,
     )
-    pin_desk_friction: tuple[float, float, float] = (0.45, 0.005, 0.0001)
+    pin_desk_friction: tuple[float, float, float] = (0.45, 0.005, 0.0005)
 
 
 @dataclass(frozen=True)
@@ -156,6 +156,7 @@ class DeliveryConfig:
 class RewardConfig:
     gamma: float = 0.99
     w_stage_phi: float = 0.40
+    w_push_phi: float = 0.60
     w_contact_speed: float = 0.60
     w_launch_angle: float = 0.60
     w_action_jerk: float = 0.005

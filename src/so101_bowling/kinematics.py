@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass
 
 import mujoco
@@ -36,6 +37,7 @@ def solve_4dof_ik(
     step_gain: float = 0.6,
     max_iters: int = 70,
     tol: float = 2e-4,
+    ik_data: mujoco.MjData | None = None,
 ) -> np.ndarray:
     """Solve 3D gripperframe position IK over the 4 active joints using DLS.
 
@@ -43,7 +45,7 @@ def solve_4dof_ik(
     ``prefer_fwd_vec`` optionally specifies ``[ux, uy, target_dot]`` to softly
     regularize the gripper's forward axis projection onto horizontal direction ``(ux, uy)``.
     """
-    d_ik = mujoco.MjData(model)
+    d_ik = ik_data if ik_data is not None else mujoco.MjData(model)
     d_ik.qpos[:] = data.qpos[:]
     q = (
         np.asarray(q_init, dtype=np.float64).copy()
@@ -110,8 +112,10 @@ class ScriptedPushController:
         self.params = params if params is not None else PushParams()
 
         self._ik_data = mujoco.MjData(model)
-        home_all = np.asarray([cfg.robot.home_qpos[name] for name in ALL_JOINTS], dtype=np.float64)
-        self._ik_data.qpos[model.jnt_qposadr[ids.all_joint_ids]] = home_all
+        self._ik_work = mujoco.MjData(model)
+        self._home_all = np.asarray([cfg.robot.home_qpos[name] for name in ALL_JOINTS], dtype=np.float64)
+        self._all_qpos_addrs = model.jnt_qposadr[ids.all_joint_ids]
+        self._ik_data.qpos[self._all_qpos_addrs] = self._home_all
         mujoco.mj_forward(model, self._ik_data)
 
         self.phase = "lift"
@@ -121,7 +125,7 @@ class ScriptedPushController:
         self._step_idx = 0
         self._est_lag: int | None = None
         self._q0: np.ndarray | None = None
-        self._q_des: np.ndarray | None = None
+        self._pending_deltas: deque[np.ndarray] = deque(maxlen=3)
         self.q_lift = np.zeros(len(ACTIVE_JOINTS), dtype=np.float64)
         self.q_stage = np.zeros(len(ACTIVE_JOINTS), dtype=np.float64)
         self.q_push_end = np.zeros(len(ACTIVE_JOINTS), dtype=np.float64)
@@ -131,6 +135,8 @@ class ScriptedPushController:
 
     def reset(self, ball_pos: np.ndarray, pin_positions: np.ndarray) -> None:
         """Plan lift, staging, and push-through joint targets for the episode layout."""
+        self._ik_data.qpos[self._all_qpos_addrs] = self._home_all
+        mujoco.mj_kinematics(self.model, self._ik_data)
         ball_xy = np.asarray(ball_pos[:2], dtype=np.float64)
         rack_xy = np.mean(np.asarray(pin_positions, dtype=np.float64)[:, :2], axis=0)
         aim = rack_xy - ball_xy
@@ -187,6 +193,7 @@ class ScriptedPushController:
             self.q_max,
             q_init=q_seed,
             prefer_fwd_vec=np.array([u_aim[0], u_aim[1], 0.20]),
+            ik_data=self._ik_work,
         )
         self.q_stage = solve_4dof_ik(
             self.model,
@@ -197,6 +204,7 @@ class ScriptedPushController:
             self.q_max,
             q_init=self.q_lift,
             prefer_fwd_vec=np.array([u_aim[0], u_aim[1], 0.20]),
+            ik_data=self._ik_work,
         )
         self.q_push_end = solve_4dof_ik(
             self.model,
@@ -207,6 +215,7 @@ class ScriptedPushController:
             self.q_max,
             q_init=self.q_stage,
             prefer_fwd_vec=np.array([u_aim[0], u_aim[1], 0.85]),
+            ik_data=self._ik_work,
         )
         self.q_push_mid = solve_4dof_ik(
             self.model,
@@ -217,6 +226,7 @@ class ScriptedPushController:
             self.q_max,
             q_init=self.q_stage,
             prefer_fwd_vec=np.array([u_aim[0], u_aim[1], 0.55]),
+            ik_data=self._ik_work,
         )
         self.q_push_end_safe = solve_4dof_ik(
             self.model,
@@ -227,6 +237,7 @@ class ScriptedPushController:
             self.q_max,
             q_init=self.q_push_mid,
             prefer_fwd_vec=np.array([u_aim[0], u_aim[1], 0.80]),
+            ik_data=self._ik_work,
         )
 
         self.phase = "lift"
@@ -236,18 +247,7 @@ class ScriptedPushController:
         self._step_idx = 0
         self._est_lag = None
         self._q0 = None
-        self._q_des = None
-
-    def _step_q_des(self, q_target: np.ndarray, max_step_rad: float) -> np.ndarray:
-        assert self._q_des is not None
-        delta = q_target - self._q_des
-        max_d = float(np.max(np.abs(delta)))
-        if max_d > max_step_rad and max_d > 1e-8:
-            self._q_des = self._q_des + delta * (max_step_rad / max_d)
-        else:
-            self._q_des = q_target.copy()
-        self._q_des = np.clip(self._q_des, self.q_min, self.q_max)
-        return self._q_des
+        self._pending_deltas.clear()
 
     def step(self, q_measured: np.ndarray) -> np.ndarray:
         """Compute normalized 4-DOF position-delta action ``a in [-1, 1]^4`` at 20 Hz."""
@@ -257,7 +257,6 @@ class ScriptedPushController:
 
         if self._step_idx == 0:
             self._q0 = qm.copy()
-            self._q_des = qm.copy()
         elif self._est_lag is None:
             assert self._q0 is not None
             if float(np.max(np.abs(qm - self._q0))) > 0.008:
@@ -289,6 +288,7 @@ class ScriptedPushController:
                 self._hold_steps += 1
                 if self._hold_steps >= 6:
                     self.phase = "retract"
+                self._pending_deltas.append(np.zeros(len(ACTIVE_JOINTS), dtype=np.float64))
                 return np.zeros(len(ACTIVE_JOINTS), dtype=np.float32)
             else:
                 q_ref = self.q_lift
@@ -298,51 +298,52 @@ class ScriptedPushController:
             max_a = float(np.max(np.abs(raw_a)))
             if max_a > scale and max_a > 1e-8:
                 raw_a = raw_a * (scale / max_a)
-            return np.clip(raw_a, -1.0, 1.0).astype(np.float32)
+            act = np.clip(raw_a, -1.0, 1.0).astype(np.float32)
+            self._pending_deltas.append(act.astype(np.float64) * max_act)
+            return act
 
-        # Lag-adaptive monotonic command generation (used during initial lag probe and lag >= 1).
+        in_flight = 2 if self._est_lag is None else self._est_lag
+        if in_flight > 0 and self._pending_deltas:
+            pending = np.sum(list(self._pending_deltas)[-in_flight:], axis=0)
+            q_pred = np.clip(qm + pending, self.q_min, self.q_max)
+        else:
+            q_pred = qm
+
         if self.phase == "lift":
-            q_ref = self._step_q_des(self.q_lift, 0.85 * max_act)
-            if (
-                np.max(np.abs(q_ref - self.q_lift)) < 1e-6
-                and np.max(np.abs(qm - self.q_lift)) < 0.045
-            ):
+            q_ref = self.q_lift
+            scale = 1.0
+            if np.max(np.abs(qm - self.q_lift)) < 0.04:
                 self.phase = "stage"
                 self._settle_steps = 0
         elif self.phase == "stage":
-            q_ref = self._step_q_des(self.q_stage, 0.70 * max_act)
-            if np.max(np.abs(q_ref - self.q_stage)) < 1e-6:
+            q_ref = self.q_stage
+            scale = 1.0
+            if np.max(np.abs(qm - self.q_stage)) < 0.03:
                 self._settle_steps += 1
-            if (
-                self._settle_steps >= 4 and np.max(np.abs(qm - self.q_stage)) < 0.035
-            ) or self._settle_steps >= 8:
+            if self._settle_steps >= 2 or self._settle_steps >= 8:
                 self.phase = "push"
                 self._push_steps = 0
         elif self.phase == "push":
             self._push_steps += 1
-            ramp = (0.30, 0.48, 0.68, 0.88)
-            ramp_scale = ramp[self._push_steps - 1] if self._push_steps <= len(ramp) else 1.0
-            push_scale = ramp_scale * speed_scale
-            q_tgt = (
-                self.q_push_mid
-                if (self._push_steps <= 5 and np.max(np.abs(qm - self.q_push_mid)) > 0.15)
-                else self.q_push_end_safe
-            )
-            q_ref = self._step_q_des(q_tgt, push_scale * max_act)
-            if self._push_steps >= 11 or (
-                self._push_steps >= 6 and np.max(np.abs(qm - self.q_push_end_safe)) < 0.12
-            ):
+            q_ref = self.q_push_end
+            scale = (0.45 if self._push_steps == 1 else 1.0) * speed_scale
+            if self._push_steps >= 5:
                 self.phase = "hold"
                 self._hold_steps = 0
-                self._q_des = qm.copy()
         elif self.phase == "hold":
             self._hold_steps += 1
-            assert self._q_des is not None
-            q_ref = self._q_des
             if self._hold_steps >= 6:
                 self.phase = "retract"
+            self._pending_deltas.append(np.zeros(len(ACTIVE_JOINTS), dtype=np.float64))
+            return np.zeros(len(ACTIVE_JOINTS), dtype=np.float32)
         else:
-            q_ref = self._step_q_des(self.q_lift, 0.85 * max_act)
+            q_ref = self.q_lift
+            scale = 1.0
 
-        raw_a = (q_ref - qm) / max_act
-        return np.clip(raw_a, -1.0, 1.0).astype(np.float32)
+        raw_a = (q_ref - q_pred) / max_act
+        max_a = float(np.max(np.abs(raw_a)))
+        if max_a > scale and max_a > 1e-8:
+            raw_a = raw_a * (scale / max_a)
+        act = np.clip(raw_a, -1.0, 1.0).astype(np.float32)
+        self._pending_deltas.append(act.astype(np.float64) * max_act)
+        return act

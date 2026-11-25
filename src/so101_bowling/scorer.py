@@ -146,25 +146,50 @@ class DeliveryScorer:
             self.invalid_reason = reason
 
     def _tilts_deg(self, up_vectors: np.ndarray) -> np.ndarray:
-        up = np.asarray(up_vectors)
-        dots = np.sum(up * self.pin_init_up_vectors, axis=1)
-        norms = np.linalg.norm(up, axis=1)
-        cosines = np.divide(dots, norms, out=np.ones(3), where=norms > 0)
+        up = np.asarray(up_vectors, dtype=np.float64)
+        dots = np.einsum("ij,ij->i", up, self.pin_init_up_vectors)
+        norms = np.sqrt(np.einsum("ij,ij->i", up, up))
+        cosines = np.divide(dots, norms, out=np.ones(3), where=norms > 0.0)
         return np.degrees(np.arccos(np.clip(cosines, -1.0, 1.0)))
 
     def _track_impacts(self, snap: SubstepSnapshot) -> None:
         self.pin_impacted |= np.asarray(snap.ball_pin_contacts, dtype=bool)
-        contacts = np.asarray(snap.pin_pin_contacts)
-        if contacts.shape == (3, 3):
-            edges = np.argwhere(contacts)
+        raw_contacts = snap.pin_pin_contacts
+        if isinstance(raw_contacts, np.ndarray) and raw_contacts.shape == (3, 3):
+            p0, p1, p2 = bool(self.pin_impacted[0]), bool(self.pin_impacted[1]), bool(self.pin_impacted[2])
+            c01 = bool(raw_contacts[0, 1] or raw_contacts[1, 0])
+            c02 = bool(raw_contacts[0, 2] or raw_contacts[2, 0])
+            c12 = bool(raw_contacts[1, 2] or raw_contacts[2, 1])
+            for _ in range(2):
+                if c01:
+                    p0 = p1 = p0 or p1
+                if c02:
+                    p0 = p2 = p0 or p2
+                if c12:
+                    p1 = p2 = p1 or p2
+            self.pin_impacted[0], self.pin_impacted[1], self.pin_impacted[2] = p0, p1, p2
         else:
-            edges = contacts
-        # A three-pin connected component needs at most two propagation passes.
-        for _ in range(2):
-            for i, j in edges:
-                self.pin_impacted[i] = self.pin_impacted[j] = (
-                    self.pin_impacted[i] or self.pin_impacted[j]
-                )
+            contacts = np.asarray(raw_contacts)
+            if contacts.shape == (3, 3):
+                p0, p1, p2 = bool(self.pin_impacted[0]), bool(self.pin_impacted[1]), bool(self.pin_impacted[2])
+                c01 = bool(contacts[0, 1] or contacts[1, 0])
+                c02 = bool(contacts[0, 2] or contacts[2, 0])
+                c12 = bool(contacts[1, 2] or contacts[2, 1])
+                for _ in range(2):
+                    if c01:
+                        p0 = p1 = p0 or p1
+                    if c02:
+                        p0 = p2 = p0 or p2
+                    if c12:
+                        p1 = p2 = p1 or p2
+                self.pin_impacted[0], self.pin_impacted[1], self.pin_impacted[2] = p0, p1, p2
+            else:
+                # A three-pin connected component needs at most two propagation passes.
+                for _ in range(2):
+                    for i, j in contacts:
+                        self.pin_impacted[i] = self.pin_impacted[j] = (
+                            self.pin_impacted[i] or self.pin_impacted[j]
+                        )
 
         tilts = self._tilts_deg(snap.pin_up_vectors)
         self.pin_peak_tilt_deg = np.maximum(

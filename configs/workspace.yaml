@@ -53,7 +53,7 @@ table:
   # MuJoCo condim="6" friction: [slide1, slide2, torsional, roll1, roll2]
   pad_friction: [0.50, 0.50, 0.005, 0.0025, 0.0025]
   desk_friction: [0.28, 0.28, 0.003, 0.0008, 0.0008]
-  pin_desk_friction: [0.45, 0.005, 0.0001]
+  pin_desk_friction: [0.45, 0.005, 0.0005]
 
 camera:
   render_height: 64
@@ -90,6 +90,7 @@ delivery:
 reward:
   gamma: 0.99
   w_stage_phi: 0.40
+  w_push_phi: 0.60
   w_contact_speed: 0.60
   w_launch_angle: 0.60
   w_action_jerk: 0.005

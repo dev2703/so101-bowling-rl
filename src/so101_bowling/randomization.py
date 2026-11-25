@@ -7,7 +7,7 @@ from typing import Any
 import mujoco
 import numpy as np
 
-from so101_bowling.assets import SceneEntityIds, compute_hollow_pin_inertia
+from so101_bowling.assets import SceneEntityIds, compute_hollow_pin_inertia, lookat_axes
 from so101_bowling.config import DRConfig, WorkspaceConfig
 
 
@@ -20,14 +20,7 @@ def _quat_mul(q1: np.ndarray, q2: np.ndarray) -> np.ndarray:
 
 def _lookat_quat(pos: np.ndarray, target: np.ndarray) -> np.ndarray:
     """Build MuJoCo camera wxyz quaternion looking from pos toward target (+Z up)."""
-    fwd = np.asarray(target, dtype=np.float64) - np.asarray(pos, dtype=np.float64)
-    fwd /= np.linalg.norm(fwd)
-    up_hint = np.array([0.0, 0.0, 1.0], dtype=np.float64)
-    if abs(float(np.dot(fwd, up_hint))) > 0.99:
-        up_hint = np.array([1.0, 0.0, 0.0], dtype=np.float64)
-    right = np.cross(fwd, up_hint)
-    right /= np.linalg.norm(right)
-    up = np.cross(right, fwd)
+    right, up, fwd = lookat_axes(pos, target)
     rot = np.column_stack((right, up, -fwd)).reshape(9)
     quat = np.empty(4, dtype=np.float64)
     mujoco.mju_mat2Quat(quat, rot)
