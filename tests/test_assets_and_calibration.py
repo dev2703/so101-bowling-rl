@@ -343,6 +343,7 @@ def test_collision_geoms_transparent_and_config_scorer_fields() -> None:
     assert cfg.reward.r_pin_credit == 5.0
     assert cfg.reward.r_strike_bonus == 5.0
     assert cfg.reward.r_illegal_penalty == -2.0
+    assert cfg.reward.w_push_phi == 0.60
     assert cfg.reward.gamma == 0.99
 
     model = mujoco.MjModel.from_xml_string(build_scene_xml(cfg))
@@ -350,6 +351,8 @@ def test_collision_geoms_transparent_and_config_scorer_fields() -> None:
     assert model.npair == 6
     data = mujoco.MjData(model)
     ids = get_scene_entity_ids(model)
+    for gid in ids.desk_geom_ids:
+        assert model.geom_condim[gid] == 6
     for jname, qpos_val in cfg.robot.home_qpos.items():
         jid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, jname)
         data.qpos[model.jnt_qposadr[jid]] = qpos_val

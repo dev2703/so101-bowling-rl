@@ -260,20 +260,29 @@ def compute_hollow_pin_inertia(
     return diag
 
 
-def _lookat_xyaxes(
-    pos: tuple[float, float, float], target: tuple[float, float, float]
-) -> str:
-    """Compute MuJoCo camera xyaxes string from world position and look-at target."""
+def lookat_axes(
+    pos: tuple[float, float, float] | np.ndarray,
+    target: tuple[float, float, float] | np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Compute orthonormal camera (right, up, forward) basis vectors looking from pos to target."""
     p = np.asarray(pos, dtype=np.float64)
     t = np.asarray(target, dtype=np.float64)
     fwd = t - p
     fwd /= np.linalg.norm(fwd)
-    up_hint = np.array([0.0, 0.0, 1.0])
+    up_hint = np.array([0.0, 0.0, 1.0], dtype=np.float64)
     if abs(float(np.dot(fwd, up_hint))) > 0.99:
-        up_hint = np.array([1.0, 0.0, 0.0])
+        up_hint = np.array([1.0, 0.0, 0.0], dtype=np.float64)
     right = np.cross(fwd, up_hint)
     right /= np.linalg.norm(right)
     up = np.cross(right, fwd)
+    return right, up, fwd
+
+
+def _lookat_xyaxes(
+    pos: tuple[float, float, float], target: tuple[float, float, float]
+) -> str:
+    """Compute MuJoCo camera xyaxes string from world position and look-at target."""
+    right, up, _ = lookat_axes(pos, target)
     return " ".join(f"{v:.6f}" for v in (*right, *up))
 
 
@@ -480,6 +489,7 @@ def build_scene_xml(
             pos=f"{0.5*(x0+x1):.6g} {0.5*(y0+y1):.6g} {-0.5*dt:.6g}",
             size=f"{0.5*(x1-x0):.6g} {0.5*(y1-y0):.6g} {0.5*dt:.6g}",
             material="desk_mat",
+            condim="6",
             friction=pin_fric,
             priority="1",
             solref="0.02 1",

@@ -91,6 +91,7 @@ def test_nominal_legal_scripted_strike_with_direct_scorer() -> None:
     assert outcome.invalid_reason is None
     assert outcome.credited_pins == 3
     assert outcome.legal_strike is True
+    assert outcome.unresolved_motion is False
     assert outcome.contact_forward_disp_m >= 0.025
     assert outcome.launch_speed >= 0.50
     assert max_arm_x <= 0.44
@@ -256,6 +257,9 @@ def test_scripted_push_dr_legality_and_ball_jitter() -> None:
     saw_ball_jitter = False
     saw_pin_jitter = False
     legal_count = 0
+    strike_count = 0
+    timeout_count = 0
+    credited_total = 0
     saw_lags: set[int] = set()
     episodes = 20
 
@@ -281,8 +285,16 @@ def test_scripted_push_dr_legality_and_ball_jitter() -> None:
                     break
             if info["outcome"]["legal_delivery"]:
                 legal_count += 1
+            if info["outcome"]["legal_strike"]:
+                strike_count += 1
+            if info.get("end_reason") == "delivery_timeout":
+                timeout_count += 1
+            credited_total += int(info["outcome"]["credited_pins"])
 
     assert saw_ball_jitter, "DomainRandomizer failed to apply ball spawn jitter"
     assert saw_pin_jitter, "DomainRandomizer failed to apply pin position jitter"
     assert saw_lags == {0, 1, 2}, f"Expected all action lags {{0,1,2}}, saw {saw_lags}"
     assert legal_count / episodes >= 0.85, f"DR legal rate too low: {legal_count}/{episodes}"
+    assert strike_count / episodes >= 0.20, f"DR strike rate regressed: {strike_count}/{episodes}"
+    assert credited_total / episodes >= 1.2, f"DR mean pins too low: {credited_total}/{episodes}"
+    assert timeout_count == 0, f"Unexpected DR delivery timeouts: {timeout_count}/{episodes}"

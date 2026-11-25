@@ -7,6 +7,7 @@ import numpy as np
 import pytest
 
 from so101_bowling import SO101BowlingEnv, load_config
+from so101_bowling.vec_env import make_vec_env
 
 ACTOR_KEYS = {"wrist_rgb", "tripod_rgb", "proprio", "camera_meta"}
 ZERO = np.zeros(4, dtype=np.float32)
@@ -134,7 +135,7 @@ def test_config_fields_propagate_to_scorer_and_dr_default():
     custom = replace(
         cfg,
         delivery=replace(cfg.delivery, foul_line_x=0.41, min_push_disp_m=0.031, wobble_tilt_deg=15.0),
-        reward=replace(cfg.reward, r_pin_credit=6.5, r_strike_bonus=4.0, r_illegal_penalty=-3.0, gamma=0.97),
+        reward=replace(cfg.reward, w_push_phi=0.85, r_pin_credit=6.5, r_strike_bonus=4.0, r_illegal_penalty=-3.0, gamma=0.97),
         dr=replace(cfg.dr, enabled=True),
     )
     with SO101BowlingEnv(cfg=custom, render_rgb=False, seed=5) as env:
@@ -143,6 +144,7 @@ def test_config_fields_propagate_to_scorer_and_dr_default():
         assert sc.foul_line_x == 0.41
         assert sc.min_push_disp_m == 0.031
         assert sc.wobble_tilt_deg == 15.0
+        assert sc.w_push_phi == 0.85
         assert sc.r_pin_credit == 6.5
         assert sc.r_strike_bonus == 4.0
         assert sc.r_illegal_penalty == -3.0
@@ -203,3 +205,66 @@ def test_env_detects_deliberate_foul_and_table_slam():
         assert done
         assert info["outcome"]["legal_delivery"] is False
         assert info["outcome"]["invalid_reason"] in ("table_slam", "foul_line_crossing", "non_pusher_ball_contact")
+
+
+def test_pin_speeds_ignore_angular_velocity_during_coast():
+    """Pin quietness checks must measure 3D linear speed (m/s), not 6D angular spin."""
+    with SO101BowlingEnv(render_rgb=False, seed=3) as env:
+        env.reset(seed=3)
+        for addr in env.ids.pin_joint_qvel_addrs:
+            env.data.qvel[addr : addr + 3] = [0.0, 0.0, 0.0]
+            env.data.qvel[addr + 3 : addr + 6] = [2.5, -1.8, 3.0]
+        snap = env._snapshot()
+        np.testing.assert_allclose(snap.pin_speeds, 0.0, atol=1e-12)
+
+
+def test_vectorized_snapshot_matches_contact_flags():
+    """Vectorized contact scanner must detect ball-pin, pin-pin, and pusher-ball contacts."""
+    with SO101BowlingEnv(render_rgb=False, seed=42) as env:
+        env.reset(seed=42)
+        from so101_bowling.kinematics import ScriptedPushController
+
+        ctrl = ScriptedPushController(env.model, env.ids, env.cfg, env.q_min, env.q_max)
+        ctrl.reset(env.data.xpos[env.ids.ball_body_id].copy(), env.data.xpos[env.ids.pin_body_ids].copy())
+        saw_pusher = False
+        for _ in range(env.cfg.delivery.max_steps):
+            _, _, done, _, _ = env.step(ctrl.step(env._measured_q()))
+            saw_pusher |= env.scorer.phase.value >= 1
+            if done:
+                break
+        assert saw_pusher
+        assert env.scorer.pin_impacted.all()
+
+
+def test_action_lag_queue_executes_delayed_deltas_without_collapse():
+    """Queued action deltas under lag > 0 must execute sequentially without stale-qpos collapse."""
+    with SO101BowlingEnv(dr_enabled=True, render_rgb=False) as env:
+        for seed in range(20):
+            env.reset(seed=seed)
+            if env._action_lag == 2:
+                break
+        assert env._action_lag == 2
+        cmd = np.array([0.6, 0.0, 0.0, 0.0], dtype=np.float32)
+        obs0, *_ = env.step(cmd)
+        obs1, *_ = env.step(cmd)
+        obs2, *_ = env.step(ZERO)
+        obs3, *_ = env.step(ZERO)
+        # First two steps execute seeded zero deltas; steps 2 and 3 both execute 0.6.
+        assert abs(float(obs0["proprio"][8])) < 0.05
+        assert abs(float(obs1["proprio"][8])) < 0.05
+        assert float(obs2["proprio"][8]) == pytest.approx(0.6, abs=0.05)
+        assert float(obs3["proprio"][8]) == pytest.approx(0.6, abs=0.05)
+
+
+def test_make_vec_env_inherits_cfg_dr_enabled_by_default():
+    """make_vec_env(dr_enabled=None) must match SO101BowlingEnv by inheriting cfg.dr.enabled."""
+    cfg = replace(load_config(), dr=replace(load_config().dr, enabled=True))
+    with make_vec_env(1, cfg=cfg, render_rgb=False, base_seed=0) as sync_env:
+        obs_a = sync_env.reset(seed=0)
+        obs_b = sync_env.reset(seed=1)
+        assert not np.array_equal(obs_a["privileged_state"], obs_b["privileged_state"])
+
+    with make_vec_env(2, cfg=cfg, render_rgb=False, base_seed=0) as subproc_env:
+        obs_2a = subproc_env.reset(seed=0)
+        obs_2b = subproc_env.reset(seed=10)
+        assert not np.array_equal(obs_2a["privileged_state"], obs_2b["privileged_state"])

@@ -19,7 +19,7 @@ def _stack_obs(obs_list: list[dict[str, np.ndarray]]) -> dict[str, np.ndarray]:
 def _worker_loop(
     conn: Any,
     cfg: WorkspaceConfig,
-    dr_enabled: bool,
+    dr_enabled: bool | None,
     render_rgb: bool,
     frame_stack: int,
     gamma: float,
@@ -65,7 +65,7 @@ class SyncVecBowlingEnv:
     def __init__(
         self,
         cfg: WorkspaceConfig,
-        dr_enabled: bool = False,
+        dr_enabled: bool | None = None,
         render_rgb: bool = True,
         frame_stack: int = 2,
         gamma: float = 0.99,
@@ -125,7 +125,7 @@ class SubprocVecBowlingEnv:
         self,
         num_envs: int,
         cfg: WorkspaceConfig,
-        dr_enabled: bool = False,
+        dr_enabled: bool | None = None,
         render_rgb: bool = True,
         frame_stack: int = 2,
         gamma: float = 0.99,
@@ -241,7 +241,7 @@ class SubprocVecBowlingEnv:
 def make_vec_env(
     num_envs: int,
     cfg: WorkspaceConfig | None = None,
-    dr_enabled: bool = False,
+    dr_enabled: bool | None = None,
     render_rgb: bool = True,
     frame_stack: int = 2,
     gamma: float = 0.99,

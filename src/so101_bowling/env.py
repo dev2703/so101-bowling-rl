@@ -87,10 +87,16 @@ class SO101BowlingEnv(gym.Env):
         self._arm_geoms = np.array(sorted(ids.arm_geom_ids), dtype=np.intp)
         self._arm_aabb = self.model.geom_aabb[self._arm_geoms].reshape(-1, 2, 3)
         self._table_geoms = ids.desk_geom_ids | ids.pad_geom_ids
-        self._pin_by_geom = {
-            geom: pin for pin, geoms in enumerate(ids.pin_geom_ids) for geom in geoms
-        }
-        self._pin_vel = np.asarray(ids.pin_joint_qvel_addrs)[:, None] + np.arange(6)
+        self._is_arm_geom = np.zeros(self.model.ngeom, dtype=bool)
+        self._is_arm_geom[list(ids.arm_geom_ids)] = True
+        self._is_pusher_geom = np.zeros(self.model.ngeom, dtype=bool)
+        self._is_pusher_geom[list(ids.pusher_geom_ids)] = True
+        self._is_table_geom = np.zeros(self.model.ngeom, dtype=bool)
+        self._is_table_geom[list(self._table_geoms)] = True
+        self._pin_geom_idx = np.full(self.model.ngeom, -1, dtype=np.intp)
+        for pin, geoms in enumerate(ids.pin_geom_ids):
+            self._pin_geom_idx[list(geoms)] = pin
+        self._pin_vel = np.asarray(ids.pin_joint_qvel_addrs)[:, None] + np.arange(3)
         self._ft = np.zeros(6)
         self._velocity = CausalJointVelocityEstimator()
 
@@ -123,6 +129,7 @@ class SO101BowlingEnv(gym.Env):
                 quiet_dwell_s=d.quiet_dwell_s,
                 max_coast_s=d.max_coast_s,
                 w_stage_phi=r.w_stage_phi,
+                w_push_phi=r.w_push_phi,
                 w_contact_speed=r.w_contact_speed,
                 w_launch_angle=r.w_launch_angle,
                 w_action_jerk=r.w_action_jerk,
@@ -169,7 +176,7 @@ class SO101BowlingEnv(gym.Env):
         self._step_count = 0
         self._prev_delta = np.zeros(n_active)
         self._action_lag = int(rng.integers(3)) if self.dr_enabled else 0
-        self._commands = deque(self._measured_q() for _ in range(self._action_lag))
+        self._commands = deque(np.zeros(n_active, dtype=np.float64) for _ in range(self._action_lag))
         self._velocity.reset()
         self._delays = [
             CameraDelayBuffer(
@@ -209,10 +216,10 @@ class SO101BowlingEnv(gym.Env):
             raise ValueError("Expected four finite action values")
         q_meas = self._measured_q()
         scale = self.max_action_rad
-        q_cmd = np.clip(q_meas + np.clip(action, -1.0, 1.0) * scale, self.q_min, self.q_max)
-        self._commands.append(q_cmd)
-        target = self._commands.popleft()
-        target = np.clip(np.clip(target, q_meas - scale, q_meas + scale), self.q_min, self.q_max)
+        delta_cmd = np.clip(action, -1.0, 1.0) * scale
+        self._commands.append(delta_cmd)
+        delayed_delta = self._commands.popleft()
+        target = np.clip(q_meas + delayed_delta, self.q_min, self.q_max)
         self._hold(target)
         applied_delta = target - q_meas
 
@@ -268,29 +275,48 @@ class SO101BowlingEnv(gym.Env):
         )
 
         pusher_ball = other_ball = arm_pin = table_slam = False
-        ball_pin = [False] * 3
+        ball_pin = [False, False, False]
         pin_pin = np.zeros((3, 3), dtype=bool)
-        for index, contact in enumerate(data.contact):
-            g1, g2 = contact.geom
-            if ids.ball_geom_id in (g1, g2):
-                other = g2 if g1 == ids.ball_geom_id else g1
-                pusher_ball |= other in ids.pusher_geom_ids
-                other_ball |= other in ids.arm_geom_ids and other not in ids.pusher_geom_ids
-                pin = self._pin_by_geom.get(other)
-                if pin is not None:
-                    ball_pin[pin] = True
-                continue
-            if g2 in ids.arm_geom_ids:
-                g1, g2 = g2, g1
-            pin1, pin2 = self._pin_by_geom.get(g1), self._pin_by_geom.get(g2)
-            if g1 in ids.arm_geom_ids:
-                arm_pin |= pin2 is not None
-                if g2 in self._table_geoms:
-                    mujoco.mj_contactForce(self.model, data, index, self._ft)
-                    table_slam |= bool(self._ft[0] > 8.0)
-            elif pin1 is not None and pin2 is not None:
-                pin_pin[pin1, pin2] = pin_pin[pin2, pin1] = True
+        ncon = int(data.ncon)
+        if ncon > 0:
+            geoms = data.contact.geom[:ncon]
+            g1 = geoms[:, 0]
+            g2 = geoms[:, 1]
+            ball_gid = ids.ball_geom_id
+            is_g1_ball = g1 == ball_gid
+            is_ball = is_g1_ball | (g2 == ball_gid)
+            if is_ball.any():
+                other = np.where(is_g1_ball[is_ball], g2[is_ball], g1[is_ball])
+                is_push = self._is_pusher_geom[other]
+                pusher_ball = bool(is_push.any())
+                other_ball = bool((self._is_arm_geom[other] & ~is_push).any())
+                p_idx = self._pin_geom_idx[other]
+                for p in p_idx[p_idx >= 0]:
+                    ball_pin[int(p)] = True
+            non_ball = ~is_ball
+            if non_ball.any():
+                nb_g1 = g1[non_ball]
+                nb_g2 = g2[non_ball]
+                a1 = self._is_arm_geom[nb_g1]
+                arm_mask = a1 | self._is_arm_geom[nb_g2]
+                if arm_mask.any():
+                    arm_other = np.where(a1[arm_mask], nb_g2[arm_mask], nb_g1[arm_mask])
+                    arm_pin = bool((self._pin_geom_idx[arm_other] >= 0).any())
+                    tbl_hits = self._is_table_geom[arm_other]
+                    if tbl_hits.any():
+                        for ci in np.flatnonzero(non_ball)[arm_mask][tbl_hits]:
+                            mujoco.mj_contactForce(self.model, data, int(ci), self._ft)
+                            if self._ft[0] > 8.0:
+                                table_slam = True
+                                break
+                p1 = self._pin_geom_idx[nb_g1]
+                p2 = self._pin_geom_idx[nb_g2]
+                pp_mask = (p1 >= 0) & (p2 >= 0)
+                if pp_mask.any():
+                    for i_p, j_p in zip(p1[pp_mask], p2[pp_mask]):
+                        pin_pin[int(i_p), int(j_p)] = pin_pin[int(j_p), int(i_p)] = True
 
+        pin_v = data.qvel[self._pin_vel]
         return SubstepSnapshot(
             t=data.time,
             paddle_pos=paddle.copy(),
@@ -298,7 +324,7 @@ class SO101BowlingEnv(gym.Env):
             ball_vel=data.qvel[ids.ball_joint_qvel_addr:ids.ball_joint_qvel_addr + 3].copy(),
             pin_positions=data.xpos[ids.pin_body_ids],
             pin_up_vectors=data.xmat[ids.pin_body_ids, 2::3],
-            pin_speeds=np.linalg.norm(data.qvel[self._pin_vel], axis=1),
+            pin_speeds=np.sqrt(np.sum(pin_v * pin_v, axis=1)),
             max_arm_x=max(float(max_x.max()), float(paddle[0])),
             pusher_ball_contact=pusher_ball,
             other_arm_ball_contact=other_ball,
