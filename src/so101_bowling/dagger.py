@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import random
 from contextlib import ExitStack
 from dataclasses import asdict, dataclass
@@ -18,7 +19,13 @@ from torch import nn
 from torch.utils.tensorboard import SummaryWriter
 
 from so101_bowling.config import WorkspaceConfig, load_config
-from so101_bowling.ppo import evaluate_actor, resolve_device
+from so101_bowling.ppo import (
+    VALIDATION_LOSS_NOTE,
+    _assert_finite_params,
+    _assert_finite_tensor,
+    evaluate_actor,
+    resolve_device,
+)
 from so101_bowling.ppo_models import (
     ACTION_DIM,
     AUX_MASK_DIM,
@@ -59,6 +66,58 @@ class DAggerConfig:
     device: str = "auto"
     eval_episodes: int = 10
     save_video: bool = True
+
+    def __post_init__(self) -> None:
+        for name in (
+            "seed",
+            "frame_stack",
+            "num_envs",
+            "rounds",
+            "steps_per_round",
+            "capacity",
+            "epochs_per_round",
+            "batch_size",
+            "drq_pad_px",
+            "eval_episodes",
+        ):
+            val = getattr(self, name)
+            if isinstance(val, bool) or not isinstance(val, int):
+                raise ValueError(f"{name} must be an int, got {type(val).__name__}")
+        for name in ("dr_enabled", "squashed", "save_video"):
+            val = getattr(self, name)
+            if not isinstance(val, bool):
+                raise ValueError(f"{name} must be a bool, got {type(val).__name__}")
+        for name in (
+            "frame_stack",
+            "num_envs",
+            "rounds",
+            "steps_per_round",
+            "capacity",
+            "epochs_per_round",
+            "batch_size",
+            "eval_episodes",
+        ):
+            if getattr(self, name) <= 0:
+                raise ValueError(f"{name} must be positive")
+        if self.drq_pad_px < 0:
+            raise ValueError("drq_pad_px must be nonnegative")
+        if self.encoder_type not in ("spatial_grid", "spatial_softmax"):
+            raise ValueError(f"Unsupported encoder_type: {self.encoder_type!r}")
+        for name in ("lr", "aux_coef", "max_grad_norm", "beta_start", "beta_end"):
+            raw_val = getattr(self, name)
+            if isinstance(raw_val, bool) or not isinstance(raw_val, (int, float)):
+                raise ValueError(f"{name} must be a real number, got {type(raw_val).__name__}")
+            if not math.isfinite(float(raw_val)):
+                raise ValueError(f"{name} must be finite, got {raw_val}")
+        if self.lr <= 0.0:
+            raise ValueError("lr must be positive")
+        if self.aux_coef < 0.0:
+            raise ValueError("aux_coef must be nonnegative")
+        if self.max_grad_norm <= 0.0:
+            raise ValueError("max_grad_norm must be positive")
+        for name in ("beta_start", "beta_end"):
+            if not (0.0 <= float(getattr(self, name)) <= 1.0):
+                raise ValueError(f"{name} must be in [0, 1]")
 
 
 def load_dagger_config(path: str | Path | None = None) -> DAggerConfig:
@@ -170,6 +229,8 @@ def train_dagger(
     last_eval: dict[str, Any] = {}
     last_log: dict[str, Any] = {}
     global_step = 0
+    nan_inf_detected = False
+    nan_inf_error: str | None = None
 
     try:
         with ExitStack() as stack:
@@ -198,6 +259,8 @@ def train_dagger(
 
                 actor.eval()
                 round_outcomes: list[dict[str, Any]] = []
+                # Sample policy choice per episode (resampling only when an env finishes).
+                use_teacher = rng.random(cfg.num_envs) < beta
                 collected = 0
                 while collected < cfg.steps_per_round:
                     with torch.no_grad():
@@ -205,9 +268,12 @@ def train_dagger(
                         s_act = actor.act(obs, deterministic=True).cpu().numpy().astype(np.float32)
                     buf.add_batch(obs, t_act)
 
-                    use_teacher = rng.random(cfg.num_envs) < beta
                     exec_act = np.where(use_teacher[:, None], t_act, s_act)
-                    obs, _, _, _, infos = vec_env.step(exec_act)
+                    obs, _, terminated, truncated, infos = vec_env.step(exec_act)
+                    done_mask = terminated | truncated
+                    if np.any(done_mask):
+                        for env_idx in np.flatnonzero(done_mask):
+                            use_teacher[env_idx] = bool(rng.random() < beta)
                     for info in infos:
                         if "outcome" in info:
                             round_outcomes.append(info["outcome"])
@@ -234,18 +300,26 @@ def train_dagger(
                         else:
                             w_sh = t_sh = None
                         dist, z_vis = actor.forward_actor(mb_obs, wrist_shifts=w_sh, tripod_shifts=t_sh)
-                        pred_act = torch.tanh(dist.mean) if actor.squashed else torch.clamp(dist.mean, -1.0, 1.0)
-                        bc_loss = F.mse_loss(pred_act, mb_t_act)
+                        if actor.squashed:
+                            pred_act = torch.tanh(dist.mean)
+                            target_act = mb_t_act.clamp(-1.0 + 1e-3, 1.0 - 1e-3)
+                        else:
+                            pred_act = torch.clamp(dist.mean, -1.0, 1.0)
+                            target_act = mb_t_act
+                        bc_loss = F.mse_loss(pred_act, target_act)
                         aux_loss = masked_aux_loss(
                             aux_head(z_vis),
                             mb_obs["privileged_aux_targets"].to(dtype=torch.float32),
                             mb_obs["privileged_aux_mask"],
                         )
                         loss = bc_loss + cfg.aux_coef * aux_loss
+                        _assert_finite_tensor(f"dagger.rnd_{rnd}.loss", loss)
                         optimizer.zero_grad(set_to_none=True)
                         loss.backward()
-                        nn.utils.clip_grad_norm_(params, cfg.max_grad_norm)
+                        grad_norm = nn.utils.clip_grad_norm_(params, cfg.max_grad_norm)
+                        _assert_finite_tensor(f"dagger.rnd_{rnd}.grad_norm", grad_norm)
                         optimizer.step()
+                        _assert_finite_params(f"dagger.rnd_{rnd}", params)
                         bc_losses.append(float(bc_loss.detach().cpu()))
                         aux_losses.append(float(aux_loss.detach().cpu()))
 
@@ -319,10 +393,39 @@ def train_dagger(
                     f"eval_ret={ev['mean_return']:.2f}",
                     flush=True,
                 )
+    except FloatingPointError as exc:
+        nan_inf_detected = True
+        nan_inf_error = str(exc)
+        eval_aux_loss = last_eval.get("eval_aux_loss") or (best_eval.get("eval_aux_loss") if best_eval else None)
+        summary = {
+            "run_dir": str(out_dir),
+            "global_step": int(global_step),
+            "total_timesteps": int(cfg.rounds * cfg.steps_per_round),
+            "best_eval": best_eval,
+            "final_eval": last_eval,
+            "last_metrics": last_log,
+            "final_losses": {
+                k: float(last_log[k])
+                for k in ("bc_loss", "aux_loss")
+                if k in last_log and isinstance(last_log[k], (int, float))
+            },
+            "eval_aux_loss": eval_aux_loss,
+            "nan_inf_detected": nan_inf_detected,
+            "nan_inf_error": nan_inf_error,
+            "validation_loss_note": VALIDATION_LOSS_NOTE,
+            "wandb_url": tracker.run_url,
+        }
+        (out_dir / "summary.json").write_text(json.dumps(summary, indent=2))
+        tracker.update_summary(summary)
+        tracker.finish(exit_code=1)
+        raise
     except Exception:
         tracker.finish(exit_code=1)
         raise
 
+    eval_aux_loss = last_eval.get("eval_aux_loss")
+    if eval_aux_loss is None and best_eval:
+        eval_aux_loss = best_eval.get("eval_aux_loss")
     summary = {
         "run_dir": str(out_dir),
         "global_step": int(global_step),
@@ -330,7 +433,14 @@ def train_dagger(
         "best_eval": best_eval,
         "final_eval": last_eval,
         "last_metrics": last_log,
-        "nan_inf_detected": False,
+        "final_losses": {
+            k: float(last_log[k])
+            for k in ("bc_loss", "aux_loss")
+            if k in last_log and isinstance(last_log[k], (int, float))
+        },
+        "eval_aux_loss": eval_aux_loss,
+        "nan_inf_detected": nan_inf_detected,
+        "validation_loss_note": VALIDATION_LOSS_NOTE,
         "wandb_url": tracker.run_url,
     }
     (out_dir / "summary.json").write_text(json.dumps(summary, indent=2))

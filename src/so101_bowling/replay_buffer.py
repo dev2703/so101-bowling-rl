@@ -50,6 +50,7 @@ class RawFrameReplayBuffer:
         self._pool_len = pool_len
         self._search_len = min(pool_len, frame_stack + 4)
         self._write_ptr = 0
+        self._cached_valid_indices: tuple[np.ndarray, np.ndarray] | None = None
         self._truncated_final_images: dict[tuple[int, int], tuple[np.ndarray, np.ndarray]] = {}
         self._obs_dims = {
             "proprio": proprio_dim,
@@ -186,6 +187,7 @@ class RawFrameReplayBuffer:
         self._is_ordinary[:, t] = ordinary
         self.occupied[:, t] = True
         self._write_ptr = (t + 1) % self.per_env_cap
+        self._cached_valid_indices = None
 
     def _valid_mask(self) -> np.ndarray:
         env_idx = np.arange(self.num_envs)[:, None, None]
@@ -206,11 +208,13 @@ class RawFrameReplayBuffer:
         return valid
 
     def valid_indices(self) -> tuple[np.ndarray, np.ndarray]:
-        return np.nonzero(self._valid_mask())
+        if self._cached_valid_indices is None:
+            self._cached_valid_indices = np.nonzero(self._valid_mask())
+        return self._cached_valid_indices
 
     @property
     def valid_size(self) -> int:
-        return int(self._valid_mask().sum())
+        return int(self.valid_indices()[0].size)
 
     def __len__(self) -> int:
         return self.valid_size

@@ -22,6 +22,17 @@ __all__ = [
     "AsymmetricSACAgent",
     "PrivilegedTwinQ",
     "RawFrameReplayBuffer",
+    "TeacherPPOConfig",
+    "load_teacher_config",
+    "PrivilegedTeacherAgent",
+    "load_teacher",
+    "train_teacher_ppo",
+    "DAggerConfig",
+    "load_dagger_config",
+    "train_dagger",
+    "WandbConfig",
+    "WandbTracker",
+    "parse_wandb_tags",
 ]
 
 
@@ -46,6 +57,24 @@ def __getattr__(name: str):
         from so101_bowling import replay_buffer
 
         return getattr(replay_buffer, name)
+    if name in (
+        "TeacherPPOConfig",
+        "load_teacher_config",
+        "PrivilegedTeacherAgent",
+        "load_teacher",
+        "train_teacher_ppo",
+    ):
+        from so101_bowling import teacher
+
+        return getattr(teacher, name)
+    if name in ("DAggerConfig", "load_dagger_config", "train_dagger"):
+        from so101_bowling import dagger
+
+        return getattr(dagger, name)
+    if name in ("WandbConfig", "WandbTracker", "parse_wandb_tags"):
+        from so101_bowling import tracking
+
+        return getattr(tracking, name)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 

@@ -192,7 +192,7 @@ def test_build_model_card_includes_steps_and_loss_metadata(tmp_path: Path) -> No
         "nan_inf_detected": False,
         "validation_loss_note": "Eval aux loss tracks visible targets.",
     }
-    for algo, expected_hint in (("ppo", "best_actor.pt"), ("sac", "actor_best.pt")):
+    for algo, expected_hint in (("ppo", "best_actor.pt"), ("sac", "actor_best.pt"), ("dagger", "actor_best.pt")):
         card = build_model_card(
             repo_id=f"user/so101-{algo}",
             run_dir=tmp_path,
@@ -206,6 +206,84 @@ def test_build_model_card_includes_steps_and_loss_metadata(tmp_path: Path) -> No
         assert "0.012300" in card
         assert "Eval aux loss tracks visible targets." in card
         assert expected_hint in card
+
+
+def test_colab_train_preflight_demo_dir_and_dagger_overrides(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import importlib.util
+
+    repo_root = Path(__file__).resolve().parents[1]
+    spec = importlib.util.spec_from_file_location(
+        "colab_train_fixes", repo_root / "scripts" / "colab_train.py"
+    )
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    # 1. --preflight must fail explicitly for teacher/dagger instead of running PPO preflight.
+    for bad_algo in ("teacher", "dagger"):
+        pf_dir = tmp_path / f"pf_{bad_algo}"
+        with pytest.raises(ValueError, match="only supported for --algo ppo or sac"):
+            mod.main(["--algo", bad_algo, "--preflight", "--mujoco-gl", "", "--run-dir", str(pf_dir)])
+        assert json.loads((pf_dir / "status.json").read_text())["state"] == "failed"
+
+    # 2. Missing explicit --demo-dir with --collect-demos 0 must raise FileNotFoundError.
+    missing_demo = tmp_path / "does_not_exist"
+    with pytest.raises(FileNotFoundError, match="--demo-dir"):
+        mod.main(
+            [
+                "--algo",
+                "sac",
+                "--demo-dir",
+                str(missing_demo),
+                "--mujoco-gl",
+                "",
+                "--run-dir",
+                str(tmp_path / "sac_missing_demo"),
+            ]
+        )
+
+    # 3. --algo dagger forwards frame_stack, aux_coef, drq_pad_px, batch_size, max_grad_norm.
+    import so101_bowling.dagger as dagger_mod
+
+    captured_cfg: list[Any] = []
+    monkeypatch.setattr(
+        dagger_mod,
+        "train_dagger",
+        lambda *, cfg, **kw: captured_cfg.append(cfg) or {"global_step": 1, "nan_inf_detected": False},
+    )
+    run_dir = tmp_path / "dagger_overrides"
+    mod.main(
+        [
+            "--algo",
+            "dagger",
+            "--teacher-checkpoint",
+            str(tmp_path / "t.pt"),
+            "--frame-stack",
+            "3",
+            "--aux-coef",
+            "0.25",
+            "--drq-pad-px",
+            "2",
+            "--batch-size",
+            "32",
+            "--max-grad-norm",
+            "0.75",
+            "--mujoco-gl",
+            "",
+            "--run-dir",
+            str(run_dir),
+        ]
+    )
+    assert len(captured_cfg) == 1
+    d_cfg = captured_cfg[0]
+    assert d_cfg.frame_stack == 3
+    assert d_cfg.aux_coef == 0.25
+    assert d_cfg.drq_pad_px == 2
+    assert d_cfg.batch_size == 32
+    assert d_cfg.max_grad_norm == 0.75
+    assert not list(run_dir.glob(".*.tmp"))
 
 
 def test_hf_private_defaults_true_and_override(

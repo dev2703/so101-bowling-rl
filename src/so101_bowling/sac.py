@@ -23,6 +23,7 @@ from so101_bowling.env import SO101BowlingEnv
 from so101_bowling.ppo import (
     VALIDATION_LOSS_NOTE,
     _assert_finite_mapping,
+    _assert_finite_params,
     _assert_finite_tensor,
     _module_grad_and_param_stats,
     evaluate_actor,
@@ -269,11 +270,10 @@ def update_sac_step(
     critic_loss.backward()
     critic_grad_norm = nn.utils.clip_grad_norm_(agent.critic.parameters(), cfg.max_grad_norm)
     _assert_finite_tensor("sac.critic_grad_norm", critic_grad_norm)
-    _module_grad_and_param_stats(agent.critic.parameters())
     critic_opt.step()
     critic_opt.zero_grad(set_to_none=True)
     agent.soft_update_target(cfg.tau)
-    _module_grad_and_param_stats(agent.critic.parameters())
+    _assert_finite_params("sac.critic", agent.critic.parameters())
 
     q_all = torch.cat((q1.detach(), q2.detach()), dim=0)
     metrics: dict[str, float] = {
@@ -344,9 +344,8 @@ def update_sac_step(
 
     actor_grad_norm = nn.utils.clip_grad_norm_(actor_params, cfg.max_grad_norm)
     _assert_finite_tensor("sac.actor_grad_norm", actor_grad_norm)
-    _module_grad_and_param_stats(actor_params)
     actor_opt.step()
-    _module_grad_and_param_stats(actor_params)
+    _assert_finite_params("sac.actor", actor_params)
 
     if cfg.autotune_alpha and alpha_opt is not None:
         alpha_opt.zero_grad(set_to_none=True)

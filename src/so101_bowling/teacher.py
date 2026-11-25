@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import math
 import random
 from contextlib import ExitStack
 from dataclasses import asdict, dataclass
@@ -24,9 +23,9 @@ from so101_bowling.env import SO101BowlingEnv
 from so101_bowling.kinematics import ScriptedPushController
 from so101_bowling.ppo import (
     _assert_finite_mapping,
+    _assert_finite_params,
     _assert_finite_tensor,
     _explained_variance,
-    _module_grad_and_param_stats,
     compute_gae,
     resolve_device,
 )
@@ -521,9 +520,10 @@ def train_teacher_ppo(
 
                         optimizer.zero_grad(set_to_none=True)
                         loss.backward()
-                        nn.utils.clip_grad_norm_(agent.parameters(), cfg.max_grad_norm)
-                        _module_grad_and_param_stats(agent.parameters())
+                        grad_norm = nn.utils.clip_grad_norm_(agent.parameters(), cfg.max_grad_norm)
+                        _assert_finite_tensor(f"teacher.upd_{update}.grad_norm", grad_norm)
                         optimizer.step()
+                        _assert_finite_params(f"teacher.upd_{update}", agent.parameters())
 
                         pg_losses.append(float(pg_loss.detach().cpu()))
                         v_losses.append(float(v_loss.detach().cpu()))

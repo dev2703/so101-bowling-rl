@@ -7,6 +7,7 @@ import json
 import os
 import signal
 import sys
+import tempfile
 import traceback
 from dataclasses import replace
 from datetime import datetime, timezone
@@ -22,7 +23,18 @@ def _write_status(path: Path, state: str, extra: dict[str, Any] | None = None) -
     if extra:
         payload.update(extra)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    body = json.dumps(payload, indent=2) + "\n"
+    with tempfile.NamedTemporaryFile(
+        mode="w",
+        encoding="utf-8",
+        dir=path.parent,
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        delete=False,
+    ) as tmp:
+        tmp.write(body)
+        tmp_path = Path(tmp.name)
+    os.replace(tmp_path, path)
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -270,13 +282,17 @@ def main(argv: list[str] | None = None) -> None:
                         steps=args.preflight_steps,
                         batch_size=args.preflight_batch_size,
                     )
-                else:
+                elif args.algo == "ppo":
                     ppo_cfg = replace(load_ppo_config(args.config), **_build_ppo_overrides(args))
                     report = preflight_ppo(
                         ppo_cfg=ppo_cfg,
                         workspace_cfg=wcfg,
                         steps=args.preflight_steps,
                         batch_size=args.preflight_batch_size,
+                    )
+                else:
+                    raise ValueError(
+                        f"--preflight is only supported for --algo ppo or sac, got {args.algo!r}"
                     )
             except FloatingPointError as exc:
                 report = {
@@ -328,6 +344,10 @@ def main(argv: list[str] | None = None) -> None:
                     repo_id=args.hf_dataset_repo,
                     private=args.hf_private,
                 )
+        elif args.demo_dir is not None and not (demo_dir.exists() and (demo_dir / "episodes").is_dir()):
+            raise FileNotFoundError(
+                f"--demo-dir {demo_dir} does not exist or is missing an episodes/ directory"
+            )
 
         wandb_cfg = (
             WandbConfig(
@@ -356,6 +376,11 @@ def main(argv: list[str] | None = None) -> None:
             )
         elif args.algo == "teacher":
             t_ov: dict[str, Any] = {"dr_enabled": args.dr}
+            eval_iv = (
+                args.eval_interval_updates
+                if args.eval_interval_updates is not None
+                else args.eval_interval
+            )
             for k, v in (
                 ("total_timesteps", args.total_timesteps),
                 ("num_envs", args.num_envs),
@@ -364,7 +389,7 @@ def main(argv: list[str] | None = None) -> None:
                 ("lr", args.lr),
                 ("rollout_steps", args.rollout_steps),
                 ("eval_episodes", args.eval_episodes),
-                ("eval_interval_updates", args.eval_interval_updates or args.eval_interval),
+                ("eval_interval_updates", eval_iv),
                 ("bc_warmup_episodes", args.bc_warmup_episodes),
             ):
                 if v is not None:
@@ -385,7 +410,12 @@ def main(argv: list[str] | None = None) -> None:
                 ("num_envs", args.num_envs),
                 ("seed", args.seed),
                 ("device", args.device),
+                ("frame_stack", args.frame_stack),
                 ("lr", args.lr),
+                ("aux_coef", args.aux_coef),
+                ("max_grad_norm", args.max_grad_norm),
+                ("drq_pad_px", args.drq_pad_px),
+                ("batch_size", args.batch_size),
                 ("rounds", args.rounds),
                 ("steps_per_round", args.steps_per_round),
                 ("eval_episodes", args.eval_episodes),
