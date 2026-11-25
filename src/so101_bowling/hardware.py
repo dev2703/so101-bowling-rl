@@ -685,6 +685,8 @@ def create_live_follower(hw_cfg: HardwareConfig) -> Any:
             cfg_kwargs["id"] = cal_path.stem
         else:
             cfg_kwargs["calibration_dir"] = cal_path
+    if self.hw_cfg.dry_run:
+            self._last_sent_active_rad = None
     return SO101Follower(SO101FollowerConfig(**cfg_kwargs))
 
 
