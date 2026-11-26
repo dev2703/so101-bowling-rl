@@ -811,6 +811,49 @@ def test_create_live_follower_lazy_import_uses_safe_defaults(monkeypatch: pytest
     assert captured["config_kwargs"]["id"] == "aligned_follower"
 
 
+def test_create_live_follower_handles_live_dry_run_and_calibration_variants(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class DummyConfig:
+        def __init__(self, **kwargs: Any) -> None:
+            self.kwargs = kwargs
+
+    class DummyFollower:
+        def __init__(self, cfg: DummyConfig) -> None:
+            self.config = cfg
+
+    mod_pkg = types.ModuleType("lerobot")
+    mod_robots = types.ModuleType("lerobot.robots")
+    mod_so = types.ModuleType("lerobot.robots.so_follower")
+    mod_so.SO101Follower = DummyFollower  # type: ignore[attr-defined]
+    mod_so.SO101FollowerConfig = DummyConfig  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "lerobot", mod_pkg)
+    monkeypatch.setitem(sys.modules, "lerobot.robots", mod_robots)
+    monkeypatch.setitem(sys.modules, "lerobot.robots.so_follower", mod_so)
+
+    base_kwargs: dict[str, Any] = {
+        "port": "/dev/tty.usbmodem1234",
+        "use_degrees": True,
+        "max_relative_target": None,
+        "cameras": {},
+    }
+    calibration_cases: list[tuple[str | None, dict[str, Any]]] = [
+        (None, base_kwargs),
+        ("/tmp/cal_dir", {**base_kwargs, "calibration_dir": Path("/tmp/cal_dir")}),
+    ]
+
+    for dry_run in (False, True):
+        for calibration_path, expected_kwargs in calibration_cases:
+            hw_cfg = HardwareConfig(
+                port="/dev/tty.usbmodem1234",
+                calibration_path=calibration_path,
+                dry_run=dry_run,
+            )
+            follower = create_live_follower(hw_cfg)
+            assert isinstance(follower, DummyFollower)
+            assert follower.config.kwargs == expected_kwargs
+
+
 def test_guard_out_of_limit_clamping_and_last_sent_lag_corners() -> None:
     wcfg = load_config()
     cal = load_calibration()
