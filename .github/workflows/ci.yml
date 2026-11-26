@@ -24,8 +24,10 @@ jobs:
         with:
           enable-cache: true
 
-      - name: Sync dependencies
-        run: uv sync --frozen --extra dev
+      - name: Sync dependencies (CPU CI without triton to avoid OSMesa LLVM SIGSEGV)
+        run: uv sync --frozen --extra dev --no-install-package triton
 
       - name: Run test suite
-        run: uv run pytest -m "not hardware"
+        run: |
+          uv run --no-sync python -c "import importlib.util; assert importlib.util.find_spec('triton') is None, 'triton must be absent on CPU OSMesa CI'"
+          uv run --no-sync pytest -m "not hardware"
