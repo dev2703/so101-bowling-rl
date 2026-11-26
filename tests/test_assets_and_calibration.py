@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import os
 from pathlib import Path
 
 import mujoco
@@ -29,9 +30,12 @@ from so101_bowling.config import (
 )
 from so101_bowling.randomization import DomainRandomizer, augment_rgb
 
-_LIVE_CAL_JSON = Path(
-    "/Users/deveshvyas/.cache/huggingface/lerobot/calibration/robots/so_follower/aligned_follower.json"
-)
+def _optional_live_calibration_path() -> Path | None:
+    raw = os.environ.get("SO101_LIVE_CALIBRATION_JSON")
+    if not raw:
+        return None
+    path = Path(raw).expanduser()
+    return path if path.exists() else None
 
 
 def _load_obj_vertices(path: Path) -> np.ndarray:
@@ -44,9 +48,7 @@ def _load_obj_vertices(path: Path) -> np.ndarray:
 
 
 def test_calibration_roundtrip_and_no_double_homing() -> None:
-    cal = load_calibration(
-        live_json_path=_LIVE_CAL_JSON if _LIVE_CAL_JSON.exists() else None
-    )
+    cal = load_calibration(live_json_path=_optional_live_calibration_path())
     assert tuple(cal.joints.keys()) == ALL_JOINTS
 
     # Verify round-trip for all 6 joints across range.

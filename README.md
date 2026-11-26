@@ -87,7 +87,7 @@ uv run python scripts/collect_dataset.py --out-dir data/demos --episodes 100 --d
 uv run python scripts/train_sac.py --out-dir runs/sac --dr --demo-dataset data/demos
 uv run python scripts/train_sac.py --out-dir runs/sac --dr --resume runs/sac/checkpoint_latest.pt
 
-# End-to-end headless GPU training on Colab Pro or modal script (MUJOCO_GL=egl + auto HF Hub & W&B)
+# End-to-end headless GPU training on Colab Pro (MUJOCO_GL=egl + auto HF Hub & W&B)
 uv run python scripts/colab_train.py \
   --algo sac --total-timesteps 100000 --collect-demos 100 --dr \
   --wandb-project so101-bowling-rl \

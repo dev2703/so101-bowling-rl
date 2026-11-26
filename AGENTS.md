@@ -1,10 +1,10 @@
 # Project Engineering & Multi-Model Routing Rules
 
 ## Repo Commands (Run Before Finishing Any Task)
-- Install: `pnpm install --frozen-lockfile`
-- Typecheck: `pnpm typecheck`
-- Lint: `pnpm lint`
-- Test: `pnpm test`
+- Install: `uv sync --frozen --extra dev`
+- Fast smoke test: `uv run pytest -m smoke -q`
+- Test (full non-hardware): `uv run pytest -m "not hardware" -q`
+- Hardware tests (live SO-101 only): `uv run pytest -m hardware -q`
 
 ## Architecture & Conventions
 - Read `docs/architecture.md` before changing cross-module interfaces.
@@ -18,15 +18,17 @@ When acting as the **Orchestrator** (top-level thread on Gemini 4 Neon):
 4. **Keep delegated briefs under 1,500 tokens.** Delegated children do not inherit parent history—include exact file paths, constraints, and expected test output in the task prompt.
 
 ### Model Routing Table
-- **Principal Advisor (`<CLAUDE_INSTANCE_ID>` / `<OPUS_5_5_MODEL_ID>`):**
+- **Principal Advisor (`claudeAgent` / `claude-opus-5-5`):**
   Escalate ONLY for high-risk architecture decisions, database schema sign-off, concurrency/race conditions, or after a builder fails twice. Pass a tight, self-contained brief and wait for the answer.
-- **High-Volume Builder (`<ANTIGRAVITY_INSTANCE_ID>` / `<HYDROGEN_MODEL_ID>`):**
+- **High-Volume Builder (`antigravity` / `gemini-4-hydrogen`):**
   Delegate scaffolding, boilerplate, broad multi-file refactors, and test-fix loops.
-- **Surgical Builder (`<CLAUDE_INSTANCE_ID>` / `<SONNET_5_5_MODEL_ID>`):**
+- **Surgical Builder (`claudeAgent` / `claude-sonnet-5-5`):**
   Delegate complex core business logic, state machines, and subtle bug fixes.
-- **Fast Mechanical Edits (`<CURSOR_INSTANCE_ID>` / `<COMPOSER_2_5_MODEL_ID>`):**
+- **Fast Recon (`claudeAgent` / `claude-haiku-5-5`):**
+  Delegate read-only codebase searches, log inspection, and file discovery.
+- **Fast Mechanical Edits (`cursor` / `grok-4.7`):**
   Delegate trivial mechanical renames or repetitive boilerplate when Cursor quota is preferred.
-- **Adversarial PR Reviewer (`<CURSOR_INSTANCE_ID>` / `<GROK_4_7_MODEL_ID>`):**
+- **Adversarial PR Reviewer (`cursor` / `grok-4.7`):**
   Delegate final review of every worktree diff before merge. Never let the same model family that wrote a feature be its sole reviewer.
 
 ## Quota & Fallback Protocol (T3 Code)
@@ -34,11 +36,11 @@ When any delegated child thread fails with a rate limit, quota exhaustion, or us
 1. **Do NOT retry the same provider instance immediately**, and **do NOT spawn a blank duplicate thread** that loses context.
 2. **Move the failed child thread in place** using `t3_thread_configure` with the next fallback `modelSelection` (`providerInstanceId` + `model` from the fallback ladder below), then resume it with `t3_thread_send`.
 3. **Fallback Ladder (use verified IDs from `orchestrator_capabilities`):**
-   - Claude Pro `Opus 5.5` exhausted -> Antigravity `Claude Opus 5.5 (Thinking)` -> Antigravity `Gemini 4 Neon (xhigh)`
-   - Claude Pro `Sonnet 5.5` exhausted -> Antigravity `Claude Sonnet 5.5 (Thinking)` -> Cursor `Grok 4.7`
-   - Antigravity `Hydrogen` exhausted -> Cursor `Grok 4.7` (or `Grok 4.6`) -> Claude Pro `Sonnet 5.5`
-   - Cursor `Grok 4.7` exhausted -> Cursor `Grok 4.6` -> cross-family review on Antigravity `Gemini 4 Neon` or Claude Pro `Sonnet 5.5`
-   - Claude Pro `Haiku` recon exhausted -> Antigravity `Gemini 4 Hydrogen (low)` -> Cursor `Grok 4.5`
+   - `claudeAgent`/`claude-opus-5-5` -> `antigravity`/`claude-opus-5-5` -> `antigravity`/`gemini-4-neon` (`thought_level: xhigh`)
+   - `claudeAgent`/`claude-sonnet-5-5` -> `cursor`/`grok-4.7`
+   - `antigravity`/`gemini-4-hydrogen` -> `cursor`/`grok-4.7` (or `cursor`/`grok-4.6`) -> `claudeAgent`/`claude-sonnet-5-5`
+   - `cursor`/`grok-4.7` -> `cursor`/`grok-4.6` -> `antigravity`/`gemini-4-neon` or `claudeAgent`/`claude-sonnet-5-5`
+   - `claudeAgent`/`claude-haiku-5-5` -> `antigravity`/`gemini-4-hydrogen` (`thought_level: low`) -> `cursor`/`grok-4.6`
 4. **Never route fallbacks to third-party models inside Cursor** (only Grok 4.7/4.6/4.5 and Composer 2.5 are covered by the Cursor Pro weekly pool).
 5. **If the user manually switches this orchestrator thread to a fallback provider**, do not leave old provider-pinned scheduled wakes running—cancel and recreate any `schedule_task` on the active provider.
 

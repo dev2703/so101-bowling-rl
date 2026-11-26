@@ -12,3 +12,13 @@ videos/
 *.egg-info/
 dist/
 build/
+
+# Local tooling, scratch, secrets, and DBs
+.t3/
+.agent-scratch/
+.env
+.env.*
+!.env.example
+node_modules/
+*.db
+*.sqlite*
