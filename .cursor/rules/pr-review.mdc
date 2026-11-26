@@ -1,0 +1,14 @@
+---
+description: Adversarial PR and worktree diff review checklist for Grok 4.7
+alwaysApply: false
+---
+Act as an adversarial reviewer auditing changes written by another model family.
+Inspect the full `git diff` against the base branch for:
+1. Logic bugs, race conditions, and unhandled edge cases.
+2. Security flaws (auth bypass, injection, missing validation, leaked secrets).
+3. Broken interfaces, regressions, and missing failure-path tests.
+
+Output ONLY:
+- **Blocking Issues** (`file:line`, failure scenario, minimal fix)
+- **Non-Blocking Nits** (max 3)
+- **Verdict:** `APPROVE` or `REQUEST_CHANGES`
