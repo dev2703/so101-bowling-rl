@@ -163,7 +163,7 @@ class SpyRobot:
     def send_action(self, action: dict[str, float]) -> dict[str, float]:
         self.sent_commands.append(dict(action))
         sent = {k: float(v) + self._send_clip_offset_deg for k, v in action.items()}
-        for j in ACTIVE_JOINTS:
+        for j in ALL_JOINTS:
             key = f"{j}.pos"
             if key in sent:
                 self.q_rad[j] = hw_to_mjcf_rad(j, sent[key], self.cal)
@@ -1580,6 +1580,409 @@ def test_safe_hold_on_lag_corner_reject_and_negotiated_camera_logging(
             assert cam.negotiated_height == 480
             assert cam.negotiated_fps == pytest.approx(30.0)
     assert any("negotiated 640x480@30.00fps differs" in rec.message for rec in caplog.records)
+
+
+def _live_bridge(**q_rad: float) -> tuple[SO101BowlingHardwareBridge, SpyRobot, list[float]]:
+    wcfg, cal, sleeps = load_config(), load_calibration(), []
+    hw_cfg = HardwareConfig(dry_run=False, calibration_path="/tmp/aligned_follower.json")
+    spy = SpyRobot(cal=cal, q_rad={**wcfg.robot.home_qpos, **q_rad})
+    bridge = SO101BowlingHardwareBridge(
+        ScriptedActor(), wcfg, cal, hw_cfg, MockCamera(), MockCamera(), robot=spy,
+        clock=FakeClock(auto_step=0.002), sleep_fn=sleeps.append,
+    )
+    bridge.connect_robot()
+    return bridge, spy, sleeps
+
+
+_RESTORE_WRITES = [
+    ("Torque_Limit", j, limit) for j, limit in zip(ALL_JOINTS, (1000,) * 5 + (500,))
+]
+_DERATE_WRITES = [("Torque_Limit", j, 200) for j in ALL_JOINTS]
+
+
+def _record_bus(spy: SpyRobot) -> list[Any]:
+    """Record goal writes, Torque_Limit writes and torque cuts in bus order."""
+    events: list[Any] = []
+    send = spy.send_action
+
+    def send_action(action: dict[str, float]) -> dict[str, float]:
+        events.append(("goal", action))
+        return send(action)
+
+    spy.send_action = send_action
+    spy.bus.write = lambda *args: events.append(args)
+    spy.bus.disable_torque = lambda: events.append("disable")
+    return events
+
+
+def test_move_to_home_dry_run_and_live_interpolation() -> None:
+    bridge, spy, sleeps = _live_bridge(shoulder_pan=0.2)
+    result = bridge.move_to_home()
+    assert result["homed"] and result["steps"] == 3 and result["max_err_rad"] <= 0.03
+    assert sleeps == pytest.approx([0.05] * 3)
+    pans = [np.radians(cmd["shoulder_pan.pos"]) for cmd in spy.sent_commands]
+    assert pans == pytest.approx([0.12, 0.04, 0.0])
+    assert bridge._last_sent_active_rad == pytest.approx(bridge._home_all_6[:4])
+    bridge.hw_cfg = HardwareConfig(dry_run=True)
+    assert bridge.move_to_home() == {"homed": True, "dry_run": True, "steps": 0, "max_err_rad": 0.0}
+    assert len(spy.sent_commands) == 3
+
+
+def test_move_to_home_rate_limits_held_joints_and_checks_full_pose(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = load_config().robot.home_qpos
+    displaced = {j: home[j] + 0.2 for j in HELD_JOINTS}  # active joints are already home
+    bridge, spy, _ = _live_bridge(**displaced)
+    assert bridge.move_to_home()["steps"] == 3
+    for j in HELD_JOINTS:
+        sent = [hw_to_mjcf_rad(j, cmd[f"{j}.pos"], bridge.cal) for cmd in spy.sent_commands]
+        assert sent == pytest.approx([home[j] + d for d in (0.12, 0.04, 0.0)])
+
+    bridge, spy, _ = _live_bridge(**displaced)
+    check_pose = bridge.safety_guard.check_pose
+
+    def reject_commanded_roll(q: np.ndarray) -> tuple[bool, str | None, float, float]:
+        # Only the 6-joint command moves wrist_roll; guard_command corners keep it measured.
+        if q[ALL_JOINTS.index("wrist_roll")] < displaced["wrist_roll"] - 1e-6:
+            return False, "z_floor_violation", 0.0, 0.0
+        return check_pose(q)
+
+    monkeypatch.setattr(bridge.safety_guard, "check_pose", reject_commanded_roll)
+    with pytest.raises(RuntimeError, match="home_pose_rejected:z_floor_violation"):
+        bridge.move_to_home()
+    assert bridge.estopped and spy.sent_commands == [] and spy.bus.disable_torque_calls == 1
+
+
+def test_move_to_home_rejects_6dof_mixed_corner_below_floor() -> None:
+    q = np.array([-1.7995, -0.167, 1.1511, -0.6287, -1.2996, 0.795])
+    bridge, spy, _ = _live_bridge(**dict(zip(ALL_JOINTS, q.tolist())))
+    guard = bridge.safety_guard
+    target = q + np.clip(bridge._home_all_6 - q, -0.08, 0.08)
+    # Measured pose, full target and every active-only lag corner are all safe...
+    assert guard.check_pose(q)[0] and guard.check_pose(target)[0]
+    assert guard.guard_command(q, target[:4]).allowed
+    # ...but held joints arriving while active joints lag dips below the floor.
+    with pytest.raises(RuntimeError, match="home_box_rejected:z_floor_violation"):
+        bridge.move_to_home()
+    assert bridge.estopped and spy.sent_commands == [] and spy.bus.disable_torque_calls == 1
+
+
+def test_6dof_transition_includes_padded_in_flight_goal() -> None:
+    guard = SafetyGuard(load_config(), load_calibration(), HardwareConfig())
+    q_meas = np.array([0.0, 0.40, -0.80, 0.0, 0.0, 0.0])
+    in_flight = q_meas + np.array([0.0, 0.10, 0.0, 0.0, 0.0, 0.0])  # safe until padded
+    assert guard.check_6dof_transition(q_meas, q_meas) == (True, None)
+    assert guard.check_pose(in_flight)[0]
+    assert guard.check_6dof_transition(q_meas, q_meas, in_flight) == (False, "foul_line_violation")
+
+
+def test_move_to_home_keeps_last_commanded_goal_and_tracks_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bridge, spy, _ = _live_bridge()
+    assert bridge.move_to_home()["steps"] == 0 and bridge._last_sent_active_rad is None
+
+    bridge, spy, _ = _live_bridge(shoulder_pan=0.2)
+    send, check = spy.send_action, bridge.safety_guard.check_6dof_transition
+    seen: list[np.ndarray | None] = []
+
+    def lagging_send(action: dict[str, float]) -> dict[str, float]:
+        sent = send(action)
+        spy.q_rad["shoulder_pan"] += 0.025  # the servo trails its goal
+        return sent
+
+    def spy_check(q: np.ndarray, target: np.ndarray, last: np.ndarray | None) -> Any:
+        seen.append(last)
+        return check(q, target, last)
+
+    spy.send_action = lagging_send
+    monkeypatch.setattr(bridge.safety_guard, "check_6dof_transition", spy_check)
+    assert bridge.move_to_home()["homed"]
+    goals = [
+        np.array([hw_to_mjcf_rad(j, cmd[f"{j}.pos"], bridge.cal) for j in ALL_JOINTS])
+        for cmd in spy.sent_commands
+    ]
+    assert len(goals) > 1 and seen[0] is None
+    np.testing.assert_allclose(seen[1:], goals[:-1])
+    np.testing.assert_allclose(bridge._last_sent_active_rad, goals[-1][:4])
+    # Once settled, the lagging measured pose replaces the in-flight goal.
+    assert goals[-1][0] == pytest.approx(goals[-2][0] + 0.025)
+
+
+def test_move_to_home_rejects_unsafe_stale_goal_when_already_settled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bridge, spy, _ = _live_bridge()
+    bridge._last_sent_active_rad = bridge._home_all_6[:4] + 0.05
+    monkeypatch.setattr(
+        bridge.safety_guard, "check_6dof_transition",
+        lambda *args: (False, "foul_line_violation"),
+    )
+    with pytest.raises(RuntimeError, match="home_box_rejected:foul_line_violation"):
+        bridge.move_to_home()
+    assert bridge.estopped and spy.sent_commands == [] and spy.bus.disable_torque_calls == 1
+
+
+@pytest.mark.parametrize("override", [
+    {"max_step_rad": 0.0}, {"max_step_rad": float("nan")}, {"settle_tol_rad": float("inf")},
+    {"settle_tol_rad": 0.0}, {"settle_tol_rad": 0.16}, {"max_steps": 0}, {"max_steps": 1001},
+])
+def test_move_to_home_rejects_invalid_overrides(override: dict[str, Any]) -> None:
+    bridge, spy, _ = _live_bridge(shoulder_pan=0.2)
+    with pytest.raises(ValueError):
+        bridge.move_to_home(**override)
+    assert spy.sent_commands == []
+
+
+@pytest.mark.parametrize(("field", "value"), [
+    ("max_step_interval_s", 0.0), ("max_step_interval_s", float("nan")),
+    ("home_settle_tol_rad", float("inf")), ("home_settle_tol_rad", 0.16),
+    ("home_max_steps", 0), ("estop_soft_hold_steps", True),
+    ("estop_soft_hold_dt_s", -0.1), ("estop_relax_torque_limit", 1001),
+    ("estop_soft_hold_steps", 26), ("estop_soft_hold_dt_s", 0.11), ("home_max_steps", 1001),
+])
+def test_invalid_safety_gate_config_fails_closed(field: str, value: Any) -> None:
+    with pytest.raises(ValueError, match=field):
+        HardwareConfig(**{field: value})
+    HardwareConfig(  # inclusive upper bounds
+        estop_soft_hold_steps=25, estop_soft_hold_dt_s=0.1, home_settle_tol_rad=0.15,
+        home_max_steps=1000,
+    )
+    bridge, spy, _ = _live_bridge()
+    object.__setattr__(bridge.hw_cfg, field, value)
+    assert bridge.step().abort_reason == "invalid_hardware_config"
+    assert bridge.estopped and spy.sent_commands == []
+
+
+@pytest.mark.parametrize(("q_rad", "reason", "num_sent"), [
+    # Jaw-only Z-floor violation is rejected by the guard before any motor write.
+    (dict(zip(ALL_JOINTS, (-0.5987, -0.7884, 1.5098, -0.1819, 2.7125, 0.8146))),
+     "home_guard_rejected:unsafe_measured_pose", 0),
+    ({"shoulder_pan": 0.5}, "home_timeout", 1),
+])
+def test_move_to_home_failures_latch_estop(q_rad: dict[str, float], reason: str, num_sent: int) -> None:
+    bridge, spy, _ = _live_bridge(**q_rad)
+    with pytest.raises(RuntimeError, match=reason):
+        bridge.move_to_home(max_steps=1)
+    assert bridge.estop_reason.startswith(reason) and spy.bus.disable_torque_calls == 1
+    with pytest.raises(RuntimeError, match="latched E-stop"):
+        bridge.move_to_home()
+    assert len(spy.sent_commands) == num_sent
+
+
+def test_move_to_home_checks_measured_pose_before_reporting_settled() -> None:
+    bridge, spy, _ = _live_bridge()
+    object.__setattr__(bridge.hw_cfg, "z_floor_margin_m", 1.0)  # home itself is now too low
+    with pytest.raises(RuntimeError, match="unsafe_measured_pose:z_floor_violation"):
+        bridge.move_to_home()
+    assert bridge.estopped and spy.sent_commands == [] and spy.bus.disable_torque_calls == 1
+
+
+@pytest.mark.parametrize("read_end", [10.06, 9.9, float("nan"), float("inf")])
+def test_move_to_home_aborts_on_bad_joint_read_latency(read_end: float) -> None:
+    bridge, spy, _ = _live_bridge(shoulder_pan=0.2)
+    bridge.clock = iter((10.0, read_end)).__next__
+    with pytest.raises(RuntimeError, match="joint_read_latency_exceeded"):
+        bridge.move_to_home()
+    assert bridge.estop_reason == "joint_read_latency_exceeded" and spy.sent_commands == []
+
+
+@pytest.mark.parametrize("write_fails", [False, True])
+def test_estop_soft_hold_then_always_disables_torque(write_fails: bool) -> None:
+    bridge, spy, sleeps = _live_bridge(shoulder_pan=0.2)
+    events = _record_bus(spy)
+
+    def failing_write(*args: Any) -> None:
+        raise RuntimeError("bus write failed")
+
+    if write_fails:
+        spy.bus.write = failing_write
+    goal = ("goal", pytest.approx(spy.get_observation()))
+    result = bridge.emergency_stop("fault")
+    assert result["soft_hold_executed"] is not write_fails and result["torque_disabled_confirmed"]
+    # The hold goal is latched before the first derating write is even attempted.
+    held = [goal, *([] if write_fails else [*_DERATE_WRITES, *[goal] * 5])]
+    # The cut comes first; then goal latch, limit restore, and a final cut.
+    cleanup = ["disable", goal, *([] if write_fails else _RESTORE_WRITES), "disable"]
+    assert events == [*held, *cleanup]
+    assert sleeps == [0.04] * (0 if write_fails else 5)
+    # A repeat stop only re-cuts torque: no soft hold, goal write or limit restore.
+    repeat = bridge.emergency_stop("again")
+    assert repeat["soft_hold_executed"] is False and repeat["torque_disabled_confirmed"]
+    assert events == [*held, *cleanup, "disable"]
+
+
+def test_connect_latches_present_goal_before_restoring_torque_limits() -> None:
+    bridge, spy, _ = _live_bridge(shoulder_pan=0.2)
+    events = _record_bus(spy)
+    goal = ("goal", pytest.approx(spy.get_observation()))
+    bridge.connect_robot()  # recovers a limit left derated by an earlier process
+    assert events == [goal, *_RESTORE_WRITES]
+    assert bridge._live_validated
+
+
+@pytest.mark.parametrize(("fault", "reason"), [
+    (None, None),
+    ("connect_raises", None),
+    ("unsafe_pose", "torque_limit_restore_failed"),
+    ("enable_fails", "torque_enable_failed"),
+])
+def test_connect_enables_torque_only_after_checks_and_latch(
+    monkeypatch: pytest.MonkeyPatch, fault: str | None, reason: str | None,
+) -> None:
+    bridge, spy, _ = _live_bridge(shoulder_pan=0.2)
+    events = _record_bus(spy)
+    connect, check_pose = spy.connect, bridge.safety_guard.check_pose
+
+    def enable_torque() -> None:
+        events.append("enable")
+        if fault == "enable_fails":
+            raise RuntimeError("enable failed")
+
+    def lerobot_connect(calibrate: bool = True) -> None:
+        connect(calibrate)
+        spy.bus.disable_torque()
+        spy.bus.enable_torque()  # SOFollower.configure() leaving bus.torque_disabled()
+        if fault == "connect_raises":
+            raise RuntimeError("connect failed")
+        events.append("connected")
+
+    def spy_check_pose(q: np.ndarray) -> Any:
+        events.append("pose")
+        return check_pose(q)
+
+    spy.bus.enable_torque = enable_torque
+    spy.connect = lerobot_connect
+    monkeypatch.setattr(bridge.safety_guard, "check_pose", spy_check_pose)
+    if fault == "unsafe_pose":
+        q_jaw_below_floor = (-0.5987, -0.7884, 1.5098, -0.1819, 2.7125, 0.8146)
+        spy.q_rad.update(zip(ALL_JOINTS, q_jaw_below_floor))
+    goal = ("goal", pytest.approx(spy.get_observation()))
+    if fault is None:
+        bridge.connect_robot()
+    else:
+        with pytest.raises((RuntimeError, ValueError)):
+            bridge.connect_robot()
+
+    latched = ["disable", "connected", "pose", goal, *_RESTORE_WRITES, "enable"]
+    assert events == {
+        None: latched,
+        "connect_raises": ["disable"],
+        "unsafe_pose": ["disable", "connected", "pose", "disable"],
+        "enable_fails": [*latched, "disable"],
+    }[fault]
+    assert spy.bus.enable_torque is enable_torque  # the real method is always put back
+    assert bridge._live_validated is (fault is None)
+    assert bridge.estop_reason == reason
+
+
+@pytest.mark.parametrize(("fault", "match"), [
+    ("unsafe_pose", "Unsafe measured pose on connect: z_floor_violation"),
+    ("non_finite_read", "Non-finite present joint position"),
+    ("send_fails", "goal write failed"),
+])
+def test_connect_goal_latch_failure_fails_closed(fault: str, match: str) -> None:
+    bridge, spy, _ = _live_bridge()
+    events = _record_bus(spy)
+
+    def failing_send(action: dict[str, float]) -> dict[str, float]:
+        raise RuntimeError("goal write failed")
+
+    if fault == "unsafe_pose":
+        q_jaw_below_floor = (-0.5987, -0.7884, 1.5098, -0.1819, 2.7125, 0.8146)
+        spy.q_rad.update(zip(ALL_JOINTS, q_jaw_below_floor))
+    elif fault == "non_finite_read":
+        spy.q_rad["elbow_flex"] = float("nan")
+    else:
+        spy.send_action = failing_send
+    with pytest.raises((RuntimeError, ValueError), match=match):
+        bridge.connect_robot()
+    assert not bridge._live_validated and bridge.estop_reason == "torque_limit_restore_failed"
+    assert events == ["disable"]  # an unvalidated robot only gets its torque cut
+    assert bridge.last_estop_result["torque_disabled_confirmed"] is True
+
+
+@pytest.mark.parametrize("fault", ["not_calibrated", "values_changed"])
+def test_connect_calibration_mismatch_only_cuts_torque(fault: str) -> None:
+    bridge, spy, _ = _live_bridge()
+    events = _record_bus(spy)
+    connect = spy.connect
+
+    def mismatched_connect(calibrate: bool = True) -> None:
+        connect(calibrate)
+        if fault == "not_calibrated":
+            spy.is_calibrated = False
+        else:
+            spy.calibration["elbow_flex"].homing_offset += 1
+
+    spy.connect = mismatched_connect
+    with pytest.raises(ValueError):
+        bridge.connect_robot()
+    assert events == ["disable"]  # no send_action and no bus.write
+    assert not bridge._live_validated and bridge.estop_reason == "calibration_mismatch"
+
+
+@pytest.mark.parametrize(("configured", "gripper"), [(200, 200), (800, 500)])
+def test_soft_hold_caps_gripper_torque_limit(configured: int, gripper: int) -> None:
+    bridge, spy, _ = _live_bridge()
+    events = _record_bus(spy)
+    bridge.hw_cfg = replace(bridge.hw_cfg, estop_relax_torque_limit=configured)
+    bridge.emergency_stop("fault")
+    expected = [configured] * 5 + [gripper]
+    assert events[0][0] == "goal"
+    assert events[1:7] == [("Torque_Limit", j, v) for j, v in zip(ALL_JOINTS, expected)]
+
+
+def test_torque_limit_restore_failure_fails_closed_on_connect() -> None:
+    bridge, spy, _ = _live_bridge()
+    attempted: list[str] = []
+
+    def write(name: str, joint: str, value: int) -> None:
+        attempted.append(joint)
+        raise RuntimeError("bus write failed")
+
+    spy.bus.write = write
+    with pytest.raises(RuntimeError, match="Torque_Limit restore failed"):
+        bridge.connect_robot()
+    assert attempted == list(ALL_JOINTS)  # no retry on a robot that never validated
+    assert not bridge._live_validated and bridge.estop_reason == "torque_limit_restore_failed"
+    assert bridge.last_estop_result["torque_disabled_confirmed"] is True
+
+
+@pytest.mark.parametrize("failing_cut", [1, 2])
+def test_unconfirmed_torque_cut_is_reported(failing_cut: int) -> None:
+    bridge, spy, _ = _live_bridge()
+    events = _record_bus(spy)
+    cuts: list[int] = []
+
+    def disable() -> None:
+        cuts.append(len(cuts) + 1)
+        if cuts[-1] == failing_cut:
+            raise RuntimeError("serial dropped")
+
+    spy.bus.disable_torque = disable
+    result = bridge.emergency_stop("fault")
+    assert result["torque_disabled_confirmed"] is False and result["error"] == "serial dropped"
+    # Limits stay derated if the first cut fails; a failed final cut is never reported as safe.
+    restored = [event for event in events if event in _RESTORE_WRITES]
+    assert restored == ([] if failing_cut == 1 else _RESTORE_WRITES)
+
+
+def test_comms_watchdog_trips_after_max_step_interval() -> None:
+    bridge, spy, _ = _live_bridge()
+
+    def step_after(gap_s: float) -> StepTrace:
+        now = bridge.clock.advance(gap_s)
+        frame = TimestampedFrame(_make_rgb(), capture_t=now, frame_seq=int(now * 1000))
+        bridge.wrist_cam.frame = bridge.tripod_cam.frame = frame
+        return bridge.step()
+
+    assert not step_after(0.0).aborted and not step_after(0.1).aborted
+    bridge.reset()  # an episode boundary disarms the watchdog
+    assert not step_after(1.0).aborted
+    assert step_after(0.3).abort_reason == "comms_watchdog_timeout"
+    assert bridge.estopped and len(spy.sent_commands) == 3
 
 
 @pytest.mark.hardware

@@ -8,7 +8,8 @@ import threading
 import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from itertools import product
 from pathlib import Path
 from typing import Any
 
@@ -42,6 +43,15 @@ _VALID_ROTATIONS = (0, 90, 180, 270)
 _BASE_MOUNT_BODIES = ("base", "shoulder")
 _CALIBRATION_FIELDS = ("id", "drive_mode", "homing_offset", "range_min", "range_max")
 _LOGGER = logging.getLogger(__name__)
+_REAL = (int, float)
+_SAFETY_GATE_RULES = {  # field: (type, range check); every field is optional in YAML
+    "max_step_interval_s": (_REAL, lambda v: v > 0),
+    "home_settle_tol_rad": (_REAL, lambda v: 0 < v <= 0.15),
+    "home_max_steps": (int, lambda v: 1 <= v <= 1000),
+    "estop_soft_hold_steps": (int, lambda v: 0 <= v <= 25),
+    "estop_soft_hold_dt_s": (_REAL, lambda v: 0 <= v <= 0.1),
+    "estop_relax_torque_limit": (int, lambda v: 0 <= v <= 1000),
+}
 
 
 @dataclass(frozen=True)
@@ -65,6 +75,12 @@ class HardwareConfig:
     max_camera_age_s: float = 0.20
     max_joint_read_latency_s: float = 0.05
     dry_run: bool = True
+    max_step_interval_s: float = 0.25
+    home_settle_tol_rad: float = 0.03
+    home_max_steps: int = 120
+    estop_soft_hold_steps: int = 5
+    estop_soft_hold_dt_s: float = 0.04
+    estop_relax_torque_limit: int = 200
 
     def __post_init__(self) -> None:
         if self.wrist_rotation_deg not in _VALID_ROTATIONS:
@@ -99,6 +115,18 @@ class HardwareConfig:
             or self.max_joint_read_latency_s <= 0.0
         ):
             raise ValueError("Staleness and latency budgets must be positive")
+        bad = _invalid_safety_gate_field(self)
+        if bad is not None:
+            raise ValueError(f"{bad} has an invalid type or range: {getattr(self, bad)!r}")
+
+
+def _invalid_safety_gate_field(hw_cfg: HardwareConfig) -> str | None:
+    """Return the name of the first invalid live safety-gate field, or None if all are valid."""
+    for name, (kind, in_range) in _SAFETY_GATE_RULES.items():
+        v = getattr(hw_cfg, name)
+        if isinstance(v, bool) or not (isinstance(v, kind) and math.isfinite(v) and in_range(v)):
+            return name
+    return None
 
 
 def _validate_runtime_thresholds(hw_cfg: HardwareConfig) -> str | None:
@@ -127,6 +155,8 @@ def _validate_runtime_thresholds(hw_cfg: HardwareConfig) -> str | None:
         math.isfinite(hw_cfg.max_joint_read_latency_s) and hw_cfg.max_joint_read_latency_s > 0.0
     ):
         return "invalid_hardware_config"
+    if _invalid_safety_gate_field(hw_cfg) is not None:
+        return "invalid_hardware_config"
     return None
 
 
@@ -136,6 +166,8 @@ def load_hardware_config(path: str | Path | None = None) -> HardwareConfig:
     if not cfg_path.exists():
         raise FileNotFoundError(f"Hardware config not found: {cfg_path}")
     raw: dict[str, Any] = yaml.safe_load(cfg_path.read_text()) or {}
+    for name in _SAFETY_GATE_RULES:
+        raw[name] = raw.get(name, getattr(HardwareConfig, name))
     return HardwareConfig(**raw)
 
 
@@ -508,6 +540,10 @@ class SafetyGuard:
 
         limits = intersect_joint_limits(cal)
         self.q_min, self.q_max = np.asarray([limits[name] for name in ACTIVE_JOINTS]).T
+        # The gripper home sits inside its limit's safety margin, so widen the bounds to home.
+        home = np.asarray([workspace_cfg.robot.home_qpos[name] for name in ALL_JOINTS])
+        low, high = np.asarray([limits[name] for name in ALL_JOINTS]).T
+        self.q_min_6, self.q_max_6 = np.minimum(low, home), np.maximum(high, home)
         self.max_action_rad = float(workspace_cfg.robot.max_action_rad)
 
     def check_pose(self, q_all_6_rad: np.ndarray) -> tuple[bool, str | None, float, float]:
@@ -639,6 +675,33 @@ class SafetyGuard:
 
         return GuardResult(True, q_clamped, None, worst_min_z, worst_max_x)
 
+    def check_6dof_transition(
+        self,
+        q_measured_6: np.ndarray,
+        target_6: np.ndarray,
+        last_sent_6: np.ndarray | None = None,
+    ) -> tuple[bool, str | None]:
+        """Check every corner (at most 2^6) of the box of poses reachable while all 6 joints move.
+
+        Each joint spans its measured value, the target and any in-flight goal, with both goals
+        padded by stopping_margin_rad along their direction of motion.
+        """
+        q_meas = np.asarray(q_measured_6, dtype=np.float64)
+        reachable = [q_meas]
+        for goal in (target_6, last_sent_6):
+            if goal is None:
+                continue
+            delta = goal - q_meas
+            pad = np.where(np.abs(delta) > 1e-9, np.sign(delta) * self.hw_cfg.stopping_margin_rad, 0.0)
+            # Clip only the padded point, so measured and goal values always stay inside the box.
+            reachable += [goal, np.clip(goal + pad, self.q_min_6, self.q_max_6)]
+        axes = zip(np.min(reachable, axis=0), np.max(reachable, axis=0))
+        for corner in product(*(np.unique(axis) for axis in axes)):
+            ok, reason, _, _ = self.check_pose(np.asarray(corner))
+            if not ok:
+                return False, reason
+        return True, None
+
 
 @dataclass(frozen=True)
 class StepTrace:
@@ -701,6 +764,7 @@ class SO101BowlingHardwareBridge:
         tripod_cam: TimestampedCamera,
         robot: Any | None = None,
         clock: Callable[[], float] = time.monotonic,
+        sleep_fn: Callable[[float], None] = time.sleep,
     ) -> None:
         self.actor = actor
         self.workspace_cfg = workspace_cfg
@@ -710,6 +774,7 @@ class SO101BowlingHardwareBridge:
         self.tripod_cam = tripod_cam
         self.robot = robot
         self.clock = clock
+        self._sleep = sleep_fn
 
         self.safety_guard = SafetyGuard(workspace_cfg, cal, hw_cfg)
         self._velocity = CausalJointVelocityEstimator()
@@ -735,6 +800,7 @@ class SO101BowlingHardwareBridge:
         self._estop_reason: str | None = None
         self.last_estop_result: dict[str, Any] | None = None
         self._live_validated: bool = False
+        self._last_live_tick_t: float | None = None
 
     @property
     def estopped(self) -> bool:
@@ -749,6 +815,7 @@ class SO101BowlingHardwareBridge:
         self._estopped = False
         self._estop_reason = None
         self.last_estop_result = None
+        self._last_live_tick_t = None
 
     def reset(self) -> None:
         """Reset temporal estimators without clearing a latched emergency stop."""
@@ -757,6 +824,7 @@ class SO101BowlingHardwareBridge:
         self._tripod_stack.reset()
         self._prev_applied_delta = np.zeros(len(ACTIVE_JOINTS), dtype=np.float64)
         self._last_sent_active_rad = None
+        self._last_live_tick_t = None
 
     def reset_episode(self) -> None:
         """Alias for reset() to satisfy TrialBridge protocol."""
@@ -829,33 +897,227 @@ class SO101BowlingHardwareBridge:
         self._validate_robot_config(self.robot)
         if getattr(self.robot, "calibration", None) is not None:
             self._validate_calibration(self.robot)
-        self.robot.connect(calibrate=False)
+        bus = getattr(self.robot, "bus", None)
+        enable_torque = getattr(bus, "enable_torque", None)
+        if callable(enable_torque):
+            # LeRobot's configure() re-enables torque on exit; stay limp until the goal is latched.
+            bus.enable_torque = lambda *args, **kwargs: None
+        try:
+            self.robot.connect(calibrate=False)
+        finally:
+            if callable(enable_torque):
+                bus.enable_torque = enable_torque
+        failure = "calibration_mismatch"
         try:
             if getattr(self.robot, "is_calibrated", False) is not True:
                 raise ValueError(
                     "Live robot must report is_calibrated is True after connect(calibrate=False)"
                 )
             self._validate_calibration(self.robot)
+            # A prior process may have died between derating torque and cutting it.
+            failure = "torque_limit_restore_failed"
+            self._restore_torque_limits(connecting=True)
+            if callable(enable_torque):
+                failure = "torque_enable_failed"
+                enable_torque()
         except Exception:
             self._live_validated = False
-            self.emergency_stop("calibration_mismatch")
+            self.emergency_stop(failure)
             raise
         self._live_validated = True
 
+    def move_to_home(self, max_step_rad: float | None = None, settle_tol_rad: float | None = None,
+                     max_steps: int | None = None) -> dict[str, Any]:
+        """Return all 6 joints to home using rate-limited, guard-checked commands."""
+        if self.hw_cfg.dry_run:
+            return {"homed": True, "dry_run": True, "steps": 0, "max_err_rad": 0.0}
+        if self._estopped or not self._live_validated or self.robot is None:
+            raise RuntimeError("move_to_home requires a validated live robot with no latched E-stop")
+        if max_step_rad is not None and not (math.isfinite(max_step_rad) and max_step_rad > 0):
+            raise ValueError(f"max_step_rad must be finite and positive, got {max_step_rad!r}")
+        cfg_reason = _validate_runtime_thresholds(self.hw_cfg)
+        if cfg_reason is not None:
+            self.emergency_stop(cfg_reason)
+            raise RuntimeError(f"move_to_home aborted: {cfg_reason}")
+        overrides = {"home_settle_tol_rad": settle_tol_rad, "home_max_steps": max_steps}
+        # replace() re-runs __post_init__, so overrides obey the same bounds as the config.
+        cfg = replace(self.hw_cfg, **{k: v for k, v in overrides.items() if v is not None})
+        step_cap = self._max_action_rad
+        if max_step_rad is not None:
+            step_cap = min(max_step_rad, step_cap)
+        low, high = self.safety_guard.q_min_6, self.safety_guard.q_max_6
+        n_active = len(ACTIVE_JOINTS)
+        # step() always commands the held joints to home alongside its active goal.
+        last_sent_6 = (None if self._last_sent_active_rad is None
+                       else np.concatenate((self._last_sent_active_rad, self._held_home)))
+        reason = "home_timeout"
+        try:
+            self._validate_active_joint_norm_modes()
+            for step in range(cfg.home_max_steps + 1):
+                t_start, t_end, q_all_6 = self._read_joints_rad()
+                # A non-finite clock fails this comparison too.
+                if not 0.0 <= t_end - t_start <= self.hw_cfg.max_joint_read_latency_s:
+                    reason = "joint_read_latency_exceeded"
+                    break
+                err_all = self._home_all_6 - q_all_6
+                max_err = float(np.max(np.abs(err_all)))
+                if max_err <= cfg.home_settle_tol_rad:
+                    pose_ok, pose_reason, _, _ = self.safety_guard.check_pose(q_all_6)
+                    if not pose_ok:
+                        reason = f"unsafe_measured_pose:{pose_reason}"
+                        break
+                    if last_sent_6 is not None and np.max(np.abs(last_sent_6 - q_all_6)) > 1e-6:
+                        box_ok, box_reason = self.safety_guard.check_6dof_transition(
+                            q_all_6, q_all_6, last_sent_6
+                        )
+                        if not box_ok:
+                            reason = f"home_box_rejected:{box_reason}"
+                            break
+                        self._send_home_goal(q_all_6)  # replace the stale in-flight goal
+                    return {"homed": True, "dry_run": False, "steps": step, "max_err_rad": max_err}
+                if step == cfg.home_max_steps:
+                    break
+                step_low, step_high = q_all_6 - step_cap, q_all_6 + step_cap
+                target = np.clip(q_all_6 + np.clip(err_all, -step_cap, step_cap), low, high)
+                target = np.clip(target, step_low, step_high)  # a limit clip must not cause a jump
+                guard = self.safety_guard.guard_command(
+                    q_all_6, target[:n_active], self._last_sent_active_rad
+                )
+                if not guard.allowed:
+                    reason = f"home_guard_rejected:{guard.reason}"
+                    break
+                target[:n_active] = np.clip(
+                    guard.target_active_4_rad, step_low[:n_active], step_high[:n_active]
+                )
+                pose_ok, pose_reason, _, _ = self.safety_guard.check_pose(target)
+                if not pose_ok:
+                    reason = f"home_pose_rejected:{pose_reason}"
+                    break
+                box_ok, box_reason = self.safety_guard.check_6dof_transition(
+                    q_all_6, target, last_sent_6
+                )
+                if not box_ok:
+                    reason = f"home_box_rejected:{box_reason}"
+                    break
+                last_sent_6 = self._send_home_goal(target)
+                self._sleep(1.0 / self.hw_cfg.control_hz)
+        except Exception as exc:
+            reason = f"home_failed:{exc}"
+        self.emergency_stop(reason)
+        raise RuntimeError(f"move_to_home aborted: {reason}")
+
+    def _send_home_goal(self, target_6: np.ndarray) -> np.ndarray:
+        """Command all 6 joints, then record and return the goal actually sent."""
+        robot: Any = self.robot
+        sent = robot.send_action(
+            {f"{j}.pos": mjcf_rad_to_hw(j, float(q), self.cal) for j, q in zip(ALL_JOINTS, target_6)}
+        )
+        sent_6 = np.asarray(
+            [hw_to_mjcf_rad(j, float(sent[f"{j}.pos"]), self.cal) for j in ALL_JOINTS]
+        )
+        if not np.isfinite(sent_6).all():
+            raise ValueError("Non-finite joint value returned by send_action")
+        self._last_sent_active_rad = sent_6[: len(ACTIVE_JOINTS)].copy()
+        return sent_6
+
+    def _read_present_command(self) -> dict[str, float]:
+        """Read all 6 present positions as a finite send_action command."""
+        robot: Any = self.robot
+        obs = robot.get_observation()
+        present = {f"{j}.pos": float(obs[f"{j}.pos"]) for j in ALL_JOINTS}
+        if not all(map(math.isfinite, present.values())):
+            raise ValueError("Non-finite present joint position")
+        return present
+
+    def _restore_torque_limits(self, *, connecting: bool = False) -> None:
+        """Rewrite volatile SRAM Torque_Limit, which stays derated until a servo power cycle.
+
+        Goal_Position is first latched to Present_Position so added torque cannot snap the arm
+        toward a stale goal. While connecting, an unsafe pose or failed latch blocks the restore.
+        """
+        robot: Any = self.robot
+        bus = getattr(robot, "bus", None)
+        if self.hw_cfg.dry_run or not hasattr(bus, "write"):
+            return
+        if hasattr(robot, "get_observation") and hasattr(robot, "send_action"):
+            try:
+                present = self._read_present_command()
+                if connecting:
+                    q = [hw_to_mjcf_rad(j, present[f"{j}.pos"], self.cal) for j in ALL_JOINTS]
+                    pose_ok, pose_reason, _, _ = self.safety_guard.check_pose(np.asarray(q))
+                    if not pose_ok:
+                        raise ValueError(f"Unsafe measured pose on connect: {pose_reason}")
+                robot.send_action(present)
+            except Exception:
+                if connecting:
+                    raise
+                _LOGGER.exception("Goal latch failed; still restoring Torque_Limit")
+        failures = []
+        for j in ALL_JOINTS:  # attempt every joint even if an earlier write fails
+            try:
+                # LeRobot caps the gripper at 50% torque.
+                bus.write("Torque_Limit", j, 500 if j == "gripper" else 1000)
+            except Exception as exc:
+                failures.append(f"{j}: {exc}")
+        if failures:
+            raise RuntimeError(f"Torque_Limit restore failed: {'; '.join(failures)}")
+
+    def _soft_hold(self) -> bool:
+        """Lower torque limits and briefly hold the measured pose ahead of the torque cut."""
+        robot: Any = self.robot
+        if not (hasattr(robot, "bus") and hasattr(robot.bus, "write")
+                and hasattr(robot, "get_observation") and hasattr(robot, "send_action")):
+            return False
+        hold = self._read_present_command()
+        robot.send_action(dict(hold))  # drop any stale goal before the slower register writes
+        for j in ALL_JOINTS:
+            limit = self.hw_cfg.estop_relax_torque_limit
+            # LeRobot caps the gripper at 50% torque.
+            robot.bus.write("Torque_Limit", j, min(limit, 500) if j == "gripper" else limit)
+        for _ in range(self.hw_cfg.estop_soft_hold_steps):
+            robot.send_action(dict(hold))
+            self._sleep(self.hw_cfg.estop_soft_hold_dt_s)
+        return True
+
+    def _disable_torque(self) -> str | None:
+        """Cut motor torque, returning the error text if the cut is unconfirmed."""
+        robot: Any = self.robot
+        try:
+            robot.bus.disable_torque()
+        except Exception as exc:
+            return str(exc)
+        return None
+
     def emergency_stop(self, reason: str) -> dict[str, Any]:
-        """Latch E-stop immediately and attempt to disable motor torque when live."""
+        """Latch E-stop, soft-hold if possible, then always attempt to disable torque when live."""
         self._estopped = True
         self._estop_reason = reason
         torque_disabled_confirmed = False
         error: str | None = None
+        soft_hold_executed = False
 
         if self.robot is not None and not self.hw_cfg.dry_run:
+            # Never command an unvalidated robot, or one whose torque is already cut.
+            torque_cut = (self.last_estop_result or {}).get("torque_disabled_confirmed")
             try:
-                self.robot.bus.disable_torque()
-                torque_disabled_confirmed = True
-            except Exception as exc:
-                torque_disabled_confirmed = False
-                error = str(exc)
+                if (self._live_validated and not torque_cut
+                        and _invalid_safety_gate_field(self.hw_cfg) is None
+                        and self.hw_cfg.estop_soft_hold_steps > 0):
+                    soft_hold_executed = self._soft_hold()
+            except Exception:
+                _LOGGER.exception("E-stop soft hold failed; disabling torque")
+            finally:
+                error = self._disable_torque()
+            # If unvalidated, the next valid connect_robot() recovers any derated limit instead.
+            if (self._live_validated and not torque_cut and error is None
+                    and hasattr(self.robot.bus, "write")):
+                try:
+                    self._restore_torque_limits()
+                except Exception:
+                    _LOGGER.exception("E-stop could not restore Torque_Limit after torque cut")
+                finally:
+                    error = self._disable_torque()  # a goal write may re-energize servos
+            torque_disabled_confirmed = error is None
 
         result = {
             "estopped": True,
@@ -863,6 +1125,7 @@ class SO101BowlingHardwareBridge:
             "dry_run": self.hw_cfg.dry_run,
             "torque_disabled_confirmed": torque_disabled_confirmed,
             "error": error,
+            "soft_hold_executed": soft_hold_executed,
         }
         self.last_estop_result = result
         return dict(result)
@@ -871,6 +1134,7 @@ class SO101BowlingHardwareBridge:
         """Disconnect live robot first (disables torque on disconnect in LeRobot), then close cameras."""
         self._live_validated = False
         self._last_sent_active_rad = None
+        self._last_live_tick_t = None
         if self.robot is not None and not self.hw_cfg.dry_run:
             if getattr(self.robot, "is_connected", False):
                 try:
@@ -996,6 +1260,12 @@ class SO101BowlingHardwareBridge:
             if cfg_reason is not None:
                 self.emergency_stop(cfg_reason)
                 return self._aborted_trace(now_entry, cfg_reason)
+
+            last_tick = self._last_live_tick_t
+            if (not self.hw_cfg.dry_run and last_tick is not None
+                    and now_entry - last_tick > self.hw_cfg.max_step_interval_s):
+                self.emergency_stop("comms_watchdog_timeout")
+                return self._aborted_trace(now_entry, "comms_watchdog_timeout")
 
             try:
                 t_start, t_end, q_all_6 = self._read_joints_rad()
@@ -1258,6 +1528,7 @@ class SO101BowlingHardwareBridge:
                         raw_tripod_rgb=tripod_raw,
                     )
                 self._last_sent_active_rad = sent_rad.copy()
+                self._last_live_tick_t = now_pre_write
                 applied_delta = sent_rad - q_active
 
             self._prev_applied_delta = applied_delta.copy()

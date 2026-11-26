@@ -1,7 +1,9 @@
 import builtins
+import io
 import json
 import runpy
 import sys
+from contextlib import nullcontext
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -478,6 +480,7 @@ def test_run_trials_cli_uses_dry_run_default_and_loads_live_calibration(
     configured_path = str(calibration_path) if calibration_source == "config" else None
     hardware_config.write_text(json.dumps({"dry_run": False, "calibration_path": configured_path}))
     calibration = object()
+    goals_at_step = []
 
     def load_calibration(*, live_json_path):
         assert live_json_path == (str(calibration_path) if live else None)
@@ -508,7 +511,16 @@ def test_run_trials_cli_uses_dry_run_default_and_loads_live_calibration(
         def connect_robot(self):
             pass
 
-        reset = FakeBridge.reset_episode
+        def reset(self):
+            FakeBridge.reset_episode(self)
+            self._last_sent_active_rad = None
+
+        def move_to_home(self):
+            self._last_sent_active_rad = np.ones(4)
+
+        def step(self):
+            goals_at_step.append(self._last_sent_active_rad)
+            return super().step()
 
     monkeypatch.setattr(config, "load_calibration", load_calibration)
     monkeypatch.setattr(hardware, "OpenCVTimestampedCamera", Camera)
@@ -516,7 +528,7 @@ def test_run_trials_cli_uses_dry_run_default_and_loads_live_calibration(
     monkeypatch.setattr(ppo_models, "load_actor", lambda path: object())
     args = []
     if live:
-        args.append("--live")
+        args.extend(("--live", "--confirm-live"))
     if calibration_source == "cli":
         args.extend(("--calibration", calibration_path))
     _run_cli(
@@ -526,6 +538,10 @@ def test_run_trials_cli_uses_dry_run_default_and_loads_live_calibration(
     )
     captured = capsys.readouterr()
     report = json.loads(captured.out)
+    if live:  # the homing goal survives reset()
+        np.testing.assert_array_equal(goals_at_step, [np.ones(4)])
+    else:
+        assert goals_at_step == [None]
     assert report["dry_run"]["n_total"] == (0 if live else 1)
     if live:
         assert "CRITICAL WARNING: Torque disable unconfirmed" in captured.err
@@ -599,3 +615,137 @@ def test_run_trials_cli_camera_index_flags(tmp_path, monkeypatch):
     assert opened_indices == [3, 4]
     assert seen_hw_cfgs[0].wrist_cam_index == 3
     assert seen_hw_cfgs[0].tripod_cam_index == 4
+
+
+@pytest.mark.parametrize(("confirm", "tty", "reply", "error"), [
+    (True, False, "", None), (False, False, "LIVE", "requires --confirm-live"),
+    (False, True, "LIVE", None), (False, True, "live", "not confirmed"),
+    (False, True, EOFError, r"cancelled \(EOF\)"),
+])
+def test_live_confirmation_gate(confirm, tty, reply, error):
+    script = Path(__file__).resolve().parents[1] / "scripts" / "run_real_transfer.py"
+    gate = runpy.run_path(str(script))["_confirm_live_execution"]
+
+    def ask(prompt):
+        if reply is EOFError:
+            raise EOFError
+        return reply
+
+    with pytest.raises(SystemExit, match=error) if error else nullcontext():
+        gate(SimpleNamespace(live=True, confirm_live=confirm), ask, is_tty=tty)
+
+
+def test_run_trials_cli_live_gate_precedes_hardware(tmp_path, monkeypatch):
+    # Any camera use before the gate would raise TypeError instead of SystemExit.
+    monkeypatch.setattr("so101_bowling.hardware.OpenCVTimestampedCamera", None)
+    monkeypatch.setattr(sys, "stdin", io.StringIO())
+    with pytest.raises(SystemExit, match="requires --confirm-live"):
+        _run_cli(monkeypatch, "run-trials", "--live", "--calibration", tmp_path / "cal.json",
+                 "--checkpoint", "missing.pt", "--policy-name", "alpha", "--out-dir", tmp_path)
+
+
+def test_paced_reset_episode_homes_against_prior_in_flight_goal(tmp_path, monkeypatch):
+    from so101_bowling import config, hardware, ppo_models, real_eval
+
+    cal = config.load_calibration()
+    home = config.load_config().robot.home_qpos
+    home_6 = np.array([home[j] for j in config.ALL_JOINTS])
+    offset = np.eye(6)[0]
+    measured = home_6 + 0.01 * offset  # already within the settle tolerance
+    prior_goal = (home_6 + 0.06 * offset)[:4]
+    present = {
+        f"{j}.pos": config.mjcf_rad_to_hw(j, q, cal) for j, q in zip(config.ALL_JOINTS, measured)
+    }
+    sent, checked = [], []
+    robot = SimpleNamespace(
+        bus=SimpleNamespace(disable_torque=lambda: None),
+        get_observation=lambda: present,
+        send_action=lambda action: sent.append(action) or action,
+    )
+
+    class Bridge(hardware.SO101BowlingHardwareBridge):
+        def __init__(self, *args):
+            super().__init__(*args, robot=robot)
+
+        def connect_robot(self):
+            self._live_validated = True
+
+    def exercise(policies, *args, **kwargs):
+        bridge = policies[0][1]
+        check = bridge.safety_guard.check_6dof_transition
+
+        def spy_check(q, target, last_sent):
+            checked.append(last_sent)
+            return check(q, target, last_sent)
+
+        bridge.safety_guard.check_6dof_transition = spy_check
+        bridge._last_sent_active_rad = prior_goal.copy()
+        bridge._last_live_tick_t = 0.0
+        bridge.reset_episode()
+        np.testing.assert_allclose(checked, [np.concatenate((prior_goal, home_6[4:]))])
+        assert sent == [pytest.approx(present)]
+        np.testing.assert_allclose(bridge._last_sent_active_rad, measured[:4])
+        assert bridge._last_live_tick_t is None and not bridge.estopped
+        return {}
+
+    camera = lambda *args, **kwargs: nullcontext(
+        SimpleNamespace(wait_ready=lambda: True, close=lambda: None)
+    )
+    monkeypatch.setattr(config, "load_calibration", lambda *, live_json_path: cal)
+    monkeypatch.setattr(hardware, "OpenCVTimestampedCamera", camera)
+    monkeypatch.setattr(hardware, "SO101BowlingHardwareBridge", Bridge)
+    monkeypatch.setattr(ppo_models, "load_actor", lambda path: object())
+    monkeypatch.setattr(real_eval, "run_real_trials", exercise)
+    _run_cli(
+        monkeypatch, "run-trials", "--live", "--confirm-live", "--calibration",
+        tmp_path / "cal.json", "--checkpoint", "fake.pt", "--policy-name", "alpha",
+        "--out-dir", tmp_path,
+    )
+    assert checked and sent  # the trial runner stub actually ran
+
+
+@pytest.mark.parametrize("failing", ["connect_robot", "move_to_home"])
+@pytest.mark.parametrize("confirmed", [True, False, None])
+def test_run_trials_cli_live_abort_warns_on_unconfirmed_torque_cut(
+    tmp_path, monkeypatch, capsys, confirmed, failing,
+):
+    from so101_bowling import config, hardware, ppo_models
+
+    class Bridge(FakeBridge):
+        def __init__(self, *args):
+            super().__init__("alpha", [])
+            self.last_estop_result = None
+
+        def emergency_stop(self, reason):
+            self.estopped = True
+            self.last_estop_result = {"torque_disabled_confirmed": confirmed}
+
+        def close(self):
+            pass
+
+        def connect_robot(self):
+            pass
+
+        def move_to_home(self):
+            pass
+
+        reset = FakeBridge.reset_episode
+
+    def fail(self):
+        raise RuntimeError("live abort")
+
+    setattr(Bridge, failing, fail)
+    camera = lambda *args, **kwargs: nullcontext(SimpleNamespace(wait_ready=lambda: True))
+    monkeypatch.setattr(config, "load_calibration", lambda *, live_json_path: object())
+    monkeypatch.setattr(hardware, "OpenCVTimestampedCamera", camera)
+    monkeypatch.setattr(hardware, "SO101BowlingHardwareBridge", Bridge)
+    monkeypatch.setattr(ppo_models, "load_actor", lambda path: object())
+
+    with pytest.raises(RuntimeError, match="live abort"):
+        _run_cli(
+            monkeypatch, "run-trials", "--live", "--confirm-live", "--calibration",
+            tmp_path / "cal.json", "--checkpoint", "fake.pt", "--policy-name", "alpha",
+            "--out-dir", tmp_path,
+        )
+    warned = "Torque disable unconfirmed during live run abort" in capsys.readouterr().err
+    assert warned is (confirmed is not True)

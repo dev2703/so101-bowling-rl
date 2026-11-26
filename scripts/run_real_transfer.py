@@ -85,6 +85,20 @@ def _operator_label(record: TrialRecord) -> dict:
         }
 
 
+def _confirm_live_execution(args: argparse.Namespace, input_fn=input, is_tty=None) -> None:
+    """Require explicit operator consent before live motor torque is enabled."""
+    if not args.live or args.confirm_live:
+        return
+    if not (sys.stdin.isatty() if is_tty is None else is_tty):
+        raise SystemExit("run-trials --live requires --confirm-live in non-interactive mode")
+    try:
+        reply = input_fn("Type 'LIVE' to enable motor torque on physical SO-101: ")
+    except EOFError:
+        raise SystemExit("Live execution cancelled (EOF).") from None
+    if reply != "LIVE":
+        raise SystemExit("Live execution not confirmed; aborting.")
+
+
 def _run_trials(args: argparse.Namespace) -> dict:
     from so101_bowling.hardware import (
         OpenCVTimestampedCamera,
@@ -95,6 +109,7 @@ def _run_trials(args: argparse.Namespace) -> dict:
     calibration_path = str(args.calibration) if args.calibration is not None else hardware.calibration_path
     if args.live and not calibration_path:
         raise SystemExit("run-trials --live requires --calibration or calibration_path in the hardware config")
+    _confirm_live_execution(args)
     wrist_cam_index = (
         hardware.wrist_cam_index if args.wrist_index is None else args.wrist_index
     )
@@ -117,7 +132,14 @@ def _run_trials(args: argparse.Namespace) -> dict:
 
     class PacedBridge(SO101BowlingHardwareBridge):
         def reset_episode(self) -> None:
-            self.reset()
+            if hardware.dry_run:
+                self.reset()
+            else:
+                self.move_to_home()  # before reset(), which would forget the in-flight goal
+                homed_goal = (None if self._last_sent_active_rad is None
+                              else self._last_sent_active_rad.copy())
+                self.reset()
+                self._last_sent_active_rad = homed_goal  # the first step still guards against it
             self._next_step_t = time.monotonic()
 
         def step(self):
@@ -131,8 +153,8 @@ def _run_trials(args: argparse.Namespace) -> dict:
         wrist, tripod = _open_live_cameras(stack, OpenCVTimestampedCamera, hardware)
         bridge = PacedBridge(actor, workspace, calibration, hardware, wrist, tripod)
         stack.callback(bridge.close)
-        bridge.connect_robot()
         try:
+            bridge.connect_robot()
             return run_real_trials(
                 [(args.policy_name, bridge)], args.trials, args.max_steps, args.out_dir,
                 mode="live" if args.live else "dry_run", outcome_labeler=args.labeler,
@@ -140,8 +162,12 @@ def _run_trials(args: argparse.Namespace) -> dict:
                 label_trial=_operator_label if args.labeler == "operator_cli" else None,
             )
         except BaseException:
-            if args.live and not bridge.estopped:
-                bridge.emergency_stop("trial_run_interrupted")
+            if args.live:
+                if not bridge.estopped:
+                    bridge.emergency_stop("trial_run_interrupted")
+                if (bridge.last_estop_result or {}).get("torque_disabled_confirmed") is not True:
+                    print("CRITICAL WARNING: Torque disable unconfirmed during live run abort.",
+                          file=sys.stderr)
             raise
 
 
@@ -175,6 +201,8 @@ def main() -> None:
     trials.add_argument("--max-steps", type=_positive_int, default=80)
     trials.add_argument("--calibration", type=Path, help="Path to live LeRobot calibration JSON.")
     trials.add_argument("--live", action="store_true", help="Enable motor commands.")
+    trials.add_argument("--confirm-live", action="store_true",
+                        help="Skip the interactive confirmation required by --live.")
     trials.add_argument("--wrist-index", type=int)
     trials.add_argument("--tripod-index", type=int)
     trials.add_argument("--labeler", default="human_video_review",
