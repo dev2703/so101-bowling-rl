@@ -129,8 +129,6 @@ class ScriptedPushController:
         self.q_lift = np.zeros(len(ACTIVE_JOINTS), dtype=np.float64)
         self.q_stage = np.zeros(len(ACTIVE_JOINTS), dtype=np.float64)
         self.q_push_end = np.zeros(len(ACTIVE_JOINTS), dtype=np.float64)
-        self.q_push_mid = np.zeros(len(ACTIVE_JOINTS), dtype=np.float64)
-        self.q_push_end_safe = np.zeros(len(ACTIVE_JOINTS), dtype=np.float64)
         self.u_aim = np.array([1.0, 0.0], dtype=np.float64)
 
     def reset(self, ball_pos: np.ndarray, pin_positions: np.ndarray) -> None:
@@ -159,17 +157,6 @@ class ScriptedPushController:
             t_clamp = (max_end_x - stage_xy[0]) / (end_xy[0] - stage_xy[0])
             end_xy = stage_xy + np.clip(t_clamp, 0.0, 1.0) * (end_xy - stage_xy)
 
-        safe_end_x = float(self.cfg.delivery.foul_line_x) - 0.032
-        end_xy_safe = raw_end_xy.copy()
-        if end_xy_safe[0] > safe_end_x and end_xy_safe[0] > stage_xy[0] + 1e-6:
-            t_clamp_safe = (safe_end_x - stage_xy[0]) / (end_xy_safe[0] - stage_xy[0])
-            end_xy_safe = stage_xy + np.clip(t_clamp_safe, 0.0, 1.0) * (end_xy_safe - stage_xy)
-
-        mid_xy = ball_xy + 0.055 * u_aim
-        if mid_xy[0] > safe_end_x and mid_xy[0] > stage_xy[0] + 1e-6:
-            t_clamp_mid = (safe_end_x - stage_xy[0]) / (mid_xy[0] - stage_xy[0])
-            mid_xy = stage_xy + np.clip(t_clamp_mid, 0.0, 1.0) * (mid_xy - stage_xy)
-
         min_clear_z = float(self.cfg.table.pad_thickness) + 0.044
         stage_z = max(float(self.params.push_height_z), min_clear_z)
         lift_z = max(stage_z + 0.078, 0.130)
@@ -178,8 +165,6 @@ class ScriptedPushController:
         p_lift = np.array([stage_xy[0], stage_xy[1], lift_z], dtype=np.float64)
         p_stage = np.array([stage_xy[0], stage_xy[1], stage_z], dtype=np.float64)
         p_end = np.array([end_xy[0], end_xy[1], end_z], dtype=np.float64)
-        p_mid = np.array([mid_xy[0], mid_xy[1], stage_z + 0.008], dtype=np.float64)
-        p_end_safe = np.array([end_xy_safe[0], end_xy_safe[1], stage_z + 0.018], dtype=np.float64)
 
         pan_seed = float(np.arctan2(stage_xy[1], stage_xy[0]))
         q_seed = np.array([pan_seed, -0.45, 0.75, 1.05], dtype=np.float64)
@@ -215,28 +200,6 @@ class ScriptedPushController:
             self.q_max,
             q_init=self.q_stage,
             prefer_fwd_vec=np.array([u_aim[0], u_aim[1], 0.85]),
-            ik_data=self._ik_work,
-        )
-        self.q_push_mid = solve_4dof_ik(
-            self.model,
-            self._ik_data,
-            self.ids,
-            p_mid,
-            self.q_min,
-            self.q_max,
-            q_init=self.q_stage,
-            prefer_fwd_vec=np.array([u_aim[0], u_aim[1], 0.55]),
-            ik_data=self._ik_work,
-        )
-        self.q_push_end_safe = solve_4dof_ik(
-            self.model,
-            self._ik_data,
-            self.ids,
-            p_end_safe,
-            self.q_min,
-            self.q_max,
-            q_init=self.q_push_mid,
-            prefer_fwd_vec=np.array([u_aim[0], u_aim[1], 0.80]),
             ik_data=self._ik_work,
         )
 
@@ -320,7 +283,7 @@ class ScriptedPushController:
             scale = 1.0
             if np.max(np.abs(qm - self.q_stage)) < 0.03:
                 self._settle_steps += 1
-            if self._settle_steps >= 2 or self._settle_steps >= 8:
+            if self._settle_steps >= 2:
                 self.phase = "push"
                 self._push_steps = 0
         elif self.phase == "push":

@@ -311,3 +311,38 @@ def test_off_table_falling_ball_and_pin_settle_cleanly_without_timeout():
     outcome = delivery.outcome(False)
     assert outcome.legal_delivery and not outcome.unresolved_motion
     assert outcome.off_table_pins == 1 and outcome.credited_pins == 1
+
+
+def _matrix_contacts(*edges: tuple[int, int]) -> np.ndarray:
+    mat = np.zeros((3, 3), dtype=bool)
+    for i, j in edges:
+        mat[i, j] = True
+    return mat
+
+
+@pytest.mark.parametrize(
+    ("pin_pin_contacts", "expected_impacted"),
+    [
+        (_matrix_contacts((2, 1), (1, 0)), [True, True, True]),
+        (
+            tuple(tuple(bool(v) for v in row) for row in _matrix_contacts((2, 1), (1, 0))),
+            [True, True, True],
+        ),
+        ([(2, 1), (1, 0)], [True, True, True]),
+        ([(0, 1)], [True, True, False]),
+        ([], [True, False, False]),
+    ],
+)
+def test_pin_pin_transitive_propagation_formats(pin_pin_contacts, expected_impacted):
+    delivery = Delivery()
+    delivery.launch()
+    delivery.step(
+        ball_pin_contacts=(True, False, False),
+        pin_pin_contacts=pin_pin_contacts,
+        pin_up_vectors=np.array([tilted(60)] * 3),
+    )
+    np.testing.assert_array_equal(delivery.scorer.pin_impacted, expected_impacted)
+    outcome = delivery.outcome()
+    expected_count = int(np.count_nonzero(expected_impacted))
+    assert outcome.credited_pins == outcome.full_knock_pins == expected_count
+    assert outcome.legal_strike is (expected_count == 3)

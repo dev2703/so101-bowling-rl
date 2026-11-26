@@ -60,7 +60,7 @@ class SubstepSnapshot:
     arm_pin_contact: bool
     table_slam: bool
     ball_pin_contacts: tuple[bool, bool, bool]
-    pin_pin_contacts: tuple[tuple[bool, bool, bool], ...] | list[tuple[int, int]]
+    pin_pin_contacts: np.ndarray | tuple[tuple[bool, bool, bool], ...] | list[tuple[int, int]]
     paddle_ball_surface_dist: float
 
 
@@ -155,11 +155,12 @@ class DeliveryScorer:
     def _track_impacts(self, snap: SubstepSnapshot) -> None:
         self.pin_impacted |= np.asarray(snap.ball_pin_contacts, dtype=bool)
         raw_contacts = snap.pin_pin_contacts
-        if isinstance(raw_contacts, np.ndarray) and raw_contacts.shape == (3, 3):
+        contacts = raw_contacts if isinstance(raw_contacts, np.ndarray) else np.asarray(raw_contacts)
+        if contacts.shape == (3, 3):
             p0, p1, p2 = bool(self.pin_impacted[0]), bool(self.pin_impacted[1]), bool(self.pin_impacted[2])
-            c01 = bool(raw_contacts[0, 1] or raw_contacts[1, 0])
-            c02 = bool(raw_contacts[0, 2] or raw_contacts[2, 0])
-            c12 = bool(raw_contacts[1, 2] or raw_contacts[2, 1])
+            c01 = bool(contacts[0, 1] or contacts[1, 0])
+            c02 = bool(contacts[0, 2] or contacts[2, 0])
+            c12 = bool(contacts[1, 2] or contacts[2, 1])
             for _ in range(2):
                 if c01:
                     p0 = p1 = p0 or p1
@@ -169,27 +170,12 @@ class DeliveryScorer:
                     p1 = p2 = p1 or p2
             self.pin_impacted[0], self.pin_impacted[1], self.pin_impacted[2] = p0, p1, p2
         else:
-            contacts = np.asarray(raw_contacts)
-            if contacts.shape == (3, 3):
-                p0, p1, p2 = bool(self.pin_impacted[0]), bool(self.pin_impacted[1]), bool(self.pin_impacted[2])
-                c01 = bool(contacts[0, 1] or contacts[1, 0])
-                c02 = bool(contacts[0, 2] or contacts[2, 0])
-                c12 = bool(contacts[1, 2] or contacts[2, 1])
-                for _ in range(2):
-                    if c01:
-                        p0 = p1 = p0 or p1
-                    if c02:
-                        p0 = p2 = p0 or p2
-                    if c12:
-                        p1 = p2 = p1 or p2
-                self.pin_impacted[0], self.pin_impacted[1], self.pin_impacted[2] = p0, p1, p2
-            else:
-                # A three-pin connected component needs at most two propagation passes.
-                for _ in range(2):
-                    for i, j in contacts:
-                        self.pin_impacted[i] = self.pin_impacted[j] = (
-                            self.pin_impacted[i] or self.pin_impacted[j]
-                        )
+            # A three-pin connected component needs at most two propagation passes.
+            for _ in range(2):
+                for i, j in raw_contacts:
+                    self.pin_impacted[i] = self.pin_impacted[j] = (
+                        self.pin_impacted[i] or self.pin_impacted[j]
+                    )
 
         tilts = self._tilts_deg(snap.pin_up_vectors)
         self.pin_peak_tilt_deg = np.maximum(
