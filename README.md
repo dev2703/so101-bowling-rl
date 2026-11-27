@@ -1,6 +1,8 @@
 # so101-bowling-rl
 
-Sim-to-real dual-camera reinforcement learning (Asymmetric PPO & Asymmetric SAC) for tabletop 3-pin push-bowling on the SO-101 robotic arm.
+A simple repo bridging gap between sim to real. 
+
+The task is simple push a plastic bowling ball to knock 3-6 bowling pins. The repo is inspired by Ocbench evals on bowling task. And it extends on the basic Behavior cloning policies demonstrated by OCbecnch repo. The aim of this repo is to explore all the RL based algorithms PPO, SAC & a couple of others for training in sim and transferring to real world scenario
 
 ## Overview
 
