@@ -16,8 +16,8 @@ from typing import Any, Protocol
 import cv2
 import numpy as np
 
-from .config import WorkspaceConfig
-from .perception_utils import TimestampedFrameStack, preprocess_camera_frame
+from so101_bowling.config import WorkspaceConfig
+from so101_bowling.perception_utils import TimestampedFrameStack, preprocess_camera_frame
 
 
 class CameraFrame(Protocol):

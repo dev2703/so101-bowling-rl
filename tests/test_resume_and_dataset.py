@@ -10,7 +10,7 @@ import pytest
 import torch
 
 from so101_bowling import AsymmetricSACAgent, RawFrameReplayBuffer, SACConfig, load_config
-from so101_bowling.dataset import collect_dataset, load_dataset_into_replay_buffer
+from so101_bowling.dataset import _to_jsonable, collect_dataset, load_dataset_into_replay_buffer
 from so101_bowling.sac import update_sac_step
 
 
@@ -388,3 +388,24 @@ def test_ppo_and_sac_noop_resume_preserves_final_eval(
     )
     assert sac_noop_summary["final_eval"] == eval_payload
     assert sac_noop_summary["eval_aux_loss"] == 0.015
+
+
+def test_to_jsonable_sanitizes_non_finite_floats() -> None:
+    payload = {
+        "nan": float("nan"),
+        "inf": float("inf"),
+        "ninf": float("-inf"),
+        "np_scalar": np.float32("nan"),
+        "nested": [1.5, np.float64("inf"), np.array([2.0, -np.inf, np.nan])],
+        "ok": "valid",
+    }
+    encoded = json.dumps(_to_jsonable(payload), allow_nan=False)
+    decoded = json.loads(encoded)
+    assert decoded == {
+        "nan": None,
+        "inf": None,
+        "ninf": None,
+        "np_scalar": None,
+        "nested": [1.5, None, [2.0, None, None]],
+        "ok": "valid",
+    }

@@ -75,6 +75,7 @@ class HardwareConfig:
     max_camera_age_s: float = 0.20
     max_joint_read_latency_s: float = 0.05
     dry_run: bool = True
+    dry_run_closed_loop: bool = False
     max_step_interval_s: float = 0.25
     home_settle_tol_rad: float = 0.03
     home_max_steps: int = 120
@@ -115,6 +116,10 @@ class HardwareConfig:
             or self.max_joint_read_latency_s <= 0.0
         ):
             raise ValueError("Staleness and latency budgets must be positive")
+        if not isinstance(self.dry_run_closed_loop, bool):
+            raise ValueError(
+                f"dry_run_closed_loop must be bool, got {self.dry_run_closed_loop!r}"
+            )
         bad = _invalid_safety_gate_field(self)
         if bad is not None:
             raise ValueError(f"{bad} has an invalid type or range: {getattr(self, bad)!r}")
@@ -131,6 +136,8 @@ def _invalid_safety_gate_field(hw_cfg: HardwareConfig) -> str | None:
 
 def _validate_runtime_thresholds(hw_cfg: HardwareConfig) -> str | None:
     """Validate all runtime safety thresholds, failing closed on NaN or invalid values."""
+    if not isinstance(hw_cfg.dry_run_closed_loop, bool):
+        return "invalid_hardware_config"
     if isinstance(hw_cfg.z_floor_margin_m, bool) or not math.isfinite(hw_cfg.z_floor_margin_m):
         return "z_floor_violation"
     if isinstance(hw_cfg.foul_line_x, bool) or not math.isfinite(hw_cfg.foul_line_x):
@@ -166,6 +173,7 @@ def load_hardware_config(path: str | Path | None = None) -> HardwareConfig:
     if not cfg_path.exists():
         raise FileNotFoundError(f"Hardware config not found: {cfg_path}")
     raw: dict[str, Any] = yaml.safe_load(cfg_path.read_text()) or {}
+    raw["dry_run_closed_loop"] = raw.get("dry_run_closed_loop", False)
     for name in _SAFETY_GATE_RULES:
         raw[name] = raw.get(name, getattr(HardwareConfig, name))
     return HardwareConfig(**raw)
@@ -793,6 +801,7 @@ class SO101BowlingHardwareBridge:
         self._held_home = np.asarray(
             [workspace_cfg.robot.home_qpos[j] for j in HELD_JOINTS], dtype=np.float64
         )
+        self._dry_run_q_6: np.ndarray = self._home_all_6.copy()
         self._prev_applied_delta = np.zeros(len(ACTIVE_JOINTS), dtype=np.float64)
         self._last_sent_active_rad: np.ndarray | None = None
 
@@ -825,6 +834,8 @@ class SO101BowlingHardwareBridge:
         self._prev_applied_delta = np.zeros(len(ACTIVE_JOINTS), dtype=np.float64)
         self._last_sent_active_rad = None
         self._last_live_tick_t = None
+        if self.hw_cfg.dry_run:
+            self._dry_run_q_6 = self._home_all_6.copy()
 
     def reset_episode(self) -> None:
         """Alias for reset() to satisfy TrialBridge protocol."""
@@ -930,6 +941,7 @@ class SO101BowlingHardwareBridge:
                      max_steps: int | None = None) -> dict[str, Any]:
         """Return all 6 joints to home using rate-limited, guard-checked commands."""
         if self.hw_cfg.dry_run:
+            self._dry_run_q_6 = self._home_all_6.copy()
             return {"homed": True, "dry_run": True, "steps": 0, "max_err_rad": 0.0}
         if self._estopped or not self._live_validated or self.robot is None:
             raise RuntimeError("move_to_home requires a validated live robot with no latched E-stop")
@@ -1189,10 +1201,14 @@ class SO101BowlingHardwareBridge:
 
     def _read_joints_rad(self) -> tuple[float, float, np.ndarray]:
         t_start = float(self.clock())
-        if self.robot is None:
-            if not self.hw_cfg.dry_run:
-                raise RuntimeError("No robot connected for live control")
-            q_rad = self._home_all_6.copy()
+        if self.hw_cfg.dry_run:
+            q_rad = (
+                self._dry_run_q_6.copy()
+                if self.hw_cfg.dry_run_closed_loop
+                else self._home_all_6.copy()
+            )
+        elif self.robot is None:
+            raise RuntimeError("No robot connected for live control")
         else:
             raw_obs = self.robot.get_observation()
             q_rad = np.asarray(
@@ -1530,6 +1546,11 @@ class SO101BowlingHardwareBridge:
                 self._last_sent_active_rad = sent_rad.copy()
                 self._last_live_tick_t = now_pre_write
                 applied_delta = sent_rad - q_active
+            elif self.hw_cfg.dry_run_closed_loop:
+                self._dry_run_q_6[: len(ACTIVE_JOINTS)] = target_active_4.copy()
+                self._dry_run_q_6[len(ACTIVE_JOINTS) :] = self._held_home.copy()
+                self._last_sent_active_rad = target_active_4.copy()
+                applied_delta = target_active_4 - q_active
 
             self._prev_applied_delta = applied_delta.copy()
             return StepTrace(

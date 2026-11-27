@@ -26,3 +26,4 @@ estop_soft_hold_dt_s: 0.04
 estop_relax_torque_limit: 200
 
 dry_run: true
+dry_run_closed_loop: true

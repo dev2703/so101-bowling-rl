@@ -119,6 +119,7 @@ def _run_trials(args: argparse.Namespace) -> dict:
     hardware = replace(
         hardware,
         dry_run=not args.live,
+        dry_run_closed_loop=False if args.live or args.open_loop_dry_run else hardware.dry_run_closed_loop,
         calibration_path=calibration_path,
         wrist_cam_index=wrist_cam_index,
         tripod_cam_index=tripod_cam_index,
@@ -201,6 +202,8 @@ def main() -> None:
     trials.add_argument("--max-steps", type=_positive_int, default=80)
     trials.add_argument("--calibration", type=Path, help="Path to live LeRobot calibration JSON.")
     trials.add_argument("--live", action="store_true", help="Enable motor commands.")
+    trials.add_argument("--open-loop-dry-run", action="store_true",
+                        help="Hold synthetic home joints during dry-run instead of closed-loop stepping.")
     trials.add_argument("--confirm-live", action="store_true",
                         help="Skip the interactive confirmation required by --live.")
     trials.add_argument("--wrist-index", type=int)

@@ -317,6 +317,81 @@ def test_dry_run_spy_robot_never_connects_writes_or_enables_torque() -> None:
     np.testing.assert_allclose(trace_none.q_rad, home_vec)
 
 
+def test_dry_run_closed_loop_evolves_state_and_rejects_non_bool(tmp_path: Path) -> None:
+    assert HardwareConfig(dry_run=True).dry_run_closed_loop is False
+    assert load_hardware_config().dry_run_closed_loop is True
+
+    for bad_val in (1, "true", None):
+        with pytest.raises(ValueError, match="dry_run_closed_loop"):
+            HardwareConfig(dry_run_closed_loop=bad_val)  # type: ignore[arg-type]
+
+    for bad_yaml in ('dry_run_closed_loop: "false"\n', "dry_run_closed_loop: 2\n"):
+        cfg_file = tmp_path / "bad_hw.yaml"
+        cfg_file.write_text(bad_yaml)
+        with pytest.raises(ValueError, match="dry_run_closed_loop"):
+            load_hardware_config(cfg_file)
+
+    wcfg = load_config()
+    cal = load_calibration()
+    hw_cfg = HardwareConfig(dry_run=True, dry_run_closed_loop=True)
+    clock = FakeClock(initial_t=1.0, auto_step=0.005)
+    spy = SpyRobot(cal=cal, q_rad=wcfg.robot.home_qpos)
+    wrist_cam = MockCamera(TimestampedFrame(_make_rgb(), capture_t=1.0, frame_seq=1))
+    tripod_cam = MockCamera(TimestampedFrame(_make_rgb(), capture_t=1.0, frame_seq=1))
+    actor = ScriptedActor(action=np.array([0.25, 0.1, -0.1, 0.05], dtype=np.float32))
+    bridge = SO101BowlingHardwareBridge(
+        actor=actor,
+        workspace_cfg=wcfg,
+        cal=cal,
+        hw_cfg=hw_cfg,
+        wrist_cam=wrist_cam,
+        tripod_cam=tripod_cam,
+        robot=spy,
+        clock=clock,
+    )
+    bridge.connect_robot()
+    home_6 = np.asarray([wcfg.robot.home_qpos[j] for j in ALL_JOINTS], dtype=np.float64)
+
+    t1 = bridge.step()
+    assert not t1.aborted
+    np.testing.assert_allclose(t1.q_rad, home_6)
+    assert np.linalg.norm(t1.applied_delta_rad) > 0.0
+    np.testing.assert_allclose(actor.seen_obs[0]["proprio"][4:8], 0.0)
+
+    clock.advance(0.05)
+    wrist_cam.frame = TimestampedFrame(_make_rgb(), capture_t=clock.t, frame_seq=2)
+    tripod_cam.frame = TimestampedFrame(_make_rgb(), capture_t=clock.t, frame_seq=2)
+    t2 = bridge.step()
+    assert not t2.aborted
+    np.testing.assert_allclose(t2.q_rad[:4], home_6[:4] + t1.applied_delta_rad)
+    np.testing.assert_allclose(t2.q_rad[4:], home_6[4:])
+    assert np.linalg.norm(t2.applied_delta_rad) > 0.0
+    assert np.linalg.norm(actor.seen_obs[1]["proprio"][4:8]) > 0.0
+
+    bridge.reset()
+    np.testing.assert_allclose(bridge._dry_run_q_6, home_6)
+    clock.advance(0.05)
+    wrist_cam.frame = TimestampedFrame(_make_rgb(), capture_t=clock.t, frame_seq=3)
+    tripod_cam.frame = TimestampedFrame(_make_rgb(), capture_t=clock.t, frame_seq=3)
+    t3 = bridge.step()
+    assert not t3.aborted
+    np.testing.assert_allclose(t3.q_rad, home_6)
+    assert not np.allclose(bridge._dry_run_q_6, home_6)
+
+    assert bridge.move_to_home() == {"homed": True, "dry_run": True, "steps": 0, "max_err_rad": 0.0}
+    np.testing.assert_allclose(bridge._dry_run_q_6, home_6)
+
+    assert spy.connect_calls == 0
+    assert spy.get_observation_calls == 0
+    assert spy.sent_commands == []
+    assert spy.bus.enable_torque_calls == 0
+    assert spy.bus.disable_torque_calls == 0
+
+    object.__setattr__(bridge.hw_cfg, "dry_run_closed_loop", 1)
+    assert bridge.step().abort_reason == "invalid_hardware_config"
+    assert bridge.estopped
+
+
 def test_safety_guard_rejects_unsafe_jaw_only_foul_line_and_16_corner_lag() -> None:
     wcfg = load_config()
     cal = load_calibration()

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
@@ -167,7 +168,7 @@ def collect_dataset(
                 "dr_enabled": bool(dr_enabled),
                 "randomization": _to_jsonable(reset_info.get("randomization", {})),
             }
-            jf.write(json.dumps(ep_meta) + "\n")
+            jf.write(json.dumps(_to_jsonable(ep_meta), allow_nan=False) + "\n")
             outcomes.append(outcome)
             total_transitions += len(rew_buf)
             saved_episodes += 1
@@ -215,7 +216,9 @@ def collect_dataset(
         ),
         "workspace_config": asdict(wcfg),
     }
-    (root / "dataset_info.json").write_text(json.dumps(dataset_info, indent=2) + "\n")
+    (root / "dataset_info.json").write_text(
+        json.dumps(_to_jsonable(dataset_info), indent=2, allow_nan=False) + "\n"
+    )
     return dataset_info
 
 
@@ -226,6 +229,8 @@ def _to_jsonable(val: Any) -> Any:
         return {str(k): _to_jsonable(v) for k, v in val.items()}
     if isinstance(val, (list, tuple)):
         return [_to_jsonable(v) for v in val]
+    if isinstance(val, float) and not math.isfinite(val):
+        return None
     return val
 
 
