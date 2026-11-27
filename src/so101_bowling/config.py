@@ -1,14 +1,16 @@
-"""Workspace configuration, calibration loading, and hardware-sim conversions."""
+"""Workspace and joint-calibration configuration for SO-101 bowling."""
 
 from __future__ import annotations
 
-import json
+import argparse
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeVar, get_type_hints
 
 import yaml
+
+T = TypeVar("T")
 
 ALL_JOINTS: tuple[str, ...] = (
     "shoulder_pan",
@@ -77,8 +79,6 @@ class PinConfig:
     body_rgba: tuple[float, float, float, float] = (0.96, 0.94, 0.88, 1.0)
     stripe_rgba: tuple[float, float, float, float] = (0.82, 0.12, 0.12, 1.0)
     mesh_dir: str = "assets/bowling"
-    num_radial_segments: int = 32
-    num_height_segments: int = 48
 
 
 @dataclass(frozen=True)
@@ -92,36 +92,15 @@ class TableConfig:
     pad_thickness: float = 0.0035
     pad_rgba: tuple[float, float, float, float] = (0.16, 0.17, 0.19, 1.0)
     pad_ramp_length: float = 0.015
-    pad_friction: tuple[float, float, float, float, float] = (
-        0.50,
-        0.50,
-        0.005,
-        0.0025,
-        0.0025,
-    )
-    desk_friction: tuple[float, float, float, float, float] = (
-        0.28,
-        0.28,
-        0.003,
-        0.0008,
-        0.0008,
-    )
+    pad_friction: tuple[float, float, float, float, float] = (0.50, 0.50, 0.005, 0.0025, 0.0025)
+    desk_friction: tuple[float, float, float, float, float] = (0.28, 0.28, 0.003, 0.0008, 0.0008)
     pin_desk_friction: tuple[float, float, float] = (0.45, 0.005, 0.0005)
 
 
 @dataclass(frozen=True)
 class CameraConfig:
-    render_height: int = 64
-    render_width: int = 112
     wrist_pos: tuple[float, float, float] = (0.045, 0.0, -0.028)
-    wrist_xyaxes: tuple[float, float, float, float, float, float] = (
-        0.0,
-        -1.0,
-        0.0,
-        0.990,
-        0.0,
-        -0.140,
-    )
+    wrist_xyaxes: tuple[float, float, float, float, float, float] = (0.0, -1.0, 0.0, 0.990, 0.0, -0.140)
     wrist_fovy: float = 72.0
     tripod_pos: tuple[float, float, float] = (0.36, -0.58, 0.44)
     tripod_target: tuple[float, float, float] = (0.38, 0.0, 0.06)
@@ -166,36 +145,6 @@ class RewardConfig:
 
 
 @dataclass(frozen=True)
-class DRConfig:
-    enabled: bool = False
-    ball_spawn_dx: float = 0.03
-    ball_spawn_dy: float = 0.05
-    ball_mass_range: tuple[float, float] = (0.030, 0.120)
-    pin_mass_range: tuple[float, float] = (0.015, 0.060)
-    pin_pos_jitter: float = 0.006
-    pad_roll_friction_scale: tuple[float, float] = (0.6, 1.8)
-    desk_roll_friction_scale: tuple[float, float] = (0.6, 1.8)
-    slide_friction_scale: tuple[float, float] = (0.7, 1.4)
-    joint_damping_scale: tuple[float, float] = (0.7, 1.4)
-    actuator_kp_scale: tuple[float, float] = (0.85, 1.15)
-    tripod_pos_jitter: float = 0.025
-    tripod_target_jitter: float = 0.015
-    tripod_fovy_jitter: float = 2.5
-    wrist_pos_jitter: float = 0.004
-    wrist_fovy_jitter: float = 2.5
-    light_pos_jitter: float = 0.20
-    light_intensity_scale: tuple[float, float] = (0.75, 1.25)
-    color_jitter: float = 0.08
-    num_distractors: int = 6
-    brightness_delta: float = 0.15
-    contrast_scale: tuple[float, float] = (0.85, 1.15)
-    gamma_range: tuple[float, float] = (0.88, 1.12)
-    saturation_scale: tuple[float, float] = (0.85, 1.15)
-    noise_std: float = 4.0
-    max_shift_px: int = 3
-
-
-@dataclass(frozen=True)
 class WorkspaceConfig:
     robot: RobotConfig = field(default_factory=RobotConfig)
     ball: BallConfig = field(default_factory=BallConfig)
@@ -204,15 +153,11 @@ class WorkspaceConfig:
     camera: CameraConfig = field(default_factory=CameraConfig)
     delivery: DeliveryConfig = field(default_factory=DeliveryConfig)
     reward: RewardConfig = field(default_factory=RewardConfig)
-    dr: DRConfig = field(default_factory=DRConfig)
 
 
 @dataclass(frozen=True)
 class JointCalibration:
     name: str
-    id: int
-    drive_mode: int
-    homing_offset: int
     range_min: int
     range_max: int
     norm_mode: str
@@ -227,16 +172,17 @@ class CalibrationMap:
     counts_per_rev: int = 4096
 
 
-def _to_tuples(raw: dict[str, Any], tuple_keys: set[str]) -> dict[str, Any]:
-    out: dict[str, Any] = {}
+def _build_section(cls: type, raw: dict[str, Any]):
+    valid = {f.name for f in fields(cls)}
+    kwargs = {}
     for k, v in raw.items():
-        if k in tuple_keys and isinstance(v, list):
-            out[k] = tuple(
-                tuple(item) if isinstance(item, list) else item for item in v
-            )
+        if k not in valid:
+            continue
+        if isinstance(v, list):
+            kwargs[k] = tuple(tuple(x) if isinstance(x, list) else x for x in v)
         else:
-            out[k] = v
-    return out
+            kwargs[k] = v
+    return cls(**kwargs)
 
 
 def load_config(path: str | Path | None = None) -> WorkspaceConfig:
@@ -244,172 +190,41 @@ def load_config(path: str | Path | None = None) -> WorkspaceConfig:
     cfg_path = Path(path) if path is not None else _DEFAULT_WORKSPACE_YAML
     if not cfg_path.exists():
         raise FileNotFoundError(f"Workspace config not found: {cfg_path}")
-
     raw: dict[str, Any] = yaml.safe_load(cfg_path.read_text()) or {}
-
-    robot_raw = _to_tuples(
-        raw.get("robot", {}), {"base_pos", "plastic_rgba", "servo_rgba"}
-    )
-    ball_raw = _to_tuples(raw.get("ball", {}), {"spawn_pos", "rgba"})
-    pin_raw = _to_tuples(
-        raw.get("pin", {}), {"positions", "body_rgba", "stripe_rgba"}
-    )
-    table_raw = _to_tuples(
-        raw.get("table", {}),
-        {
-            "desk_x_range",
-            "desk_y_range",
-            "desk_rgba",
-            "pad_x_range",
-            "pad_y_range",
-            "pad_rgba",
-            "pad_friction",
-            "desk_friction",
-            "pin_desk_friction",
-        },
-    )
-    cam_raw = _to_tuples(
-        raw.get("camera", {}),
-        {
-            "wrist_pos",
-            "wrist_xyaxes",
-            "tripod_pos",
-            "tripod_target",
-            "overview_pos",
-            "overview_target",
-        },
-    )
-    delivery_raw = raw.get("delivery", {})
-    reward_raw = raw.get("reward", {})
-    dr_raw = _to_tuples(
-        raw.get("dr", {}),
-        {
-            "ball_mass_range",
-            "pin_mass_range",
-            "pad_roll_friction_scale",
-            "desk_roll_friction_scale",
-            "slide_friction_scale",
-            "joint_damping_scale",
-            "actuator_kp_scale",
-            "light_intensity_scale",
-            "contrast_scale",
-            "gamma_range",
-            "saturation_scale",
-        },
-    )
-
     return WorkspaceConfig(
-        robot=RobotConfig(**robot_raw),
-        ball=BallConfig(**ball_raw),
-        pin=PinConfig(**pin_raw),
-        table=TableConfig(**table_raw),
-        camera=CameraConfig(**cam_raw),
-        delivery=DeliveryConfig(**delivery_raw),
-        reward=RewardConfig(**reward_raw),
-        dr=DRConfig(**dr_raw),
+        robot=_build_section(RobotConfig, raw.get("robot", {})),
+        ball=_build_section(BallConfig, raw.get("ball", {})),
+        pin=_build_section(PinConfig, raw.get("pin", {})),
+        table=_build_section(TableConfig, raw.get("table", {})),
+        camera=_build_section(CameraConfig, raw.get("camera", {})),
+        delivery=_build_section(DeliveryConfig, raw.get("delivery", {})),
+        reward=_build_section(RewardConfig, raw.get("reward", {})),
     )
 
 
-def load_calibration(
-    yaml_path: str | Path | None = None,
-    live_json_path: str | Path | None = None,
-) -> CalibrationMap:
-    """Load calibration from YAML and optionally overlay a live LeRobot JSON file."""
+def load_calibration(yaml_path: str | Path | None = None) -> CalibrationMap:
+    """Load joint calibration limits from configs/so101_calibration.yaml."""
     cal_path = Path(yaml_path) if yaml_path is not None else _DEFAULT_CALIBRATION_YAML
     if not cal_path.exists():
         raise FileNotFoundError(f"Calibration YAML not found: {cal_path}")
-
     raw = yaml.safe_load(cal_path.read_text()) or {}
-    counts_per_rev = int(raw.get("counts_per_rev", 4096))
-    safety_margin_rad = float(raw.get("safety_margin_rad", 0.02))
     raw_joints: dict[str, dict[str, Any]] = raw.get("joints", {})
-
-    live_data: dict[str, dict[str, Any]] = {}
-    if live_json_path is not None:
-        live_p = Path(live_json_path)
-        if not live_p.exists():
-            raise FileNotFoundError(f"Live calibration JSON not found: {live_p}")
-        live_data = json.loads(live_p.read_text())
-
-    joints: dict[str, JointCalibration] = {}
-    for jname in ALL_JOINTS:
-        if jname not in raw_joints:
-            raise KeyError(f"Missing joint {jname!r} in {cal_path}")
-        entry = dict(raw_joints[jname])
-        if jname in live_data:
-            for field_name in (
-                "id",
-                "drive_mode",
-                "homing_offset",
-                "range_min",
-                "range_max",
-            ):
-                if field_name in live_data[jname]:
-                    entry[field_name] = live_data[jname][field_name]
-        joints[jname] = JointCalibration(
-            name=jname,
-            id=int(entry["id"]),
-            drive_mode=int(entry["drive_mode"]),
-            homing_offset=int(entry["homing_offset"]),
-            range_min=int(entry["range_min"]),
-            range_max=int(entry["range_max"]),
-            norm_mode=str(entry["norm_mode"]),
-            mjcf_min=float(entry["mjcf_min"]),
-            mjcf_max=float(entry["mjcf_max"]),
+    joints = {
+        name: JointCalibration(
+            name=name,
+            range_min=int(raw_joints[name]["range_min"]),
+            range_max=int(raw_joints[name]["range_max"]),
+            norm_mode=str(raw_joints[name]["norm_mode"]),
+            mjcf_min=float(raw_joints[name]["mjcf_min"]),
+            mjcf_max=float(raw_joints[name]["mjcf_max"]),
         )
-
+        for name in ALL_JOINTS
+    }
     return CalibrationMap(
         joints=joints,
-        safety_margin_rad=safety_margin_rad,
-        counts_per_rev=counts_per_rev,
+        safety_margin_rad=float(raw.get("safety_margin_rad", 0.02)),
+        counts_per_rev=int(raw.get("counts_per_rev", 4096)),
     )
-
-
-def raw_ticks_to_hw(joint_name: str, raw_ticks: float, cal: CalibrationMap) -> float:
-    """Convert raw STS3215 counts (post-EEPROM homing_offset) to LeRobot calibrated hw units.
-
-    Matches LeRobot motors_bus.py:
-    - DEGREES: deg = (raw - mid) * 360.0 / (counts_per_rev - 1), negated if drive_mode == 1.
-    - RANGE_0_100: norm = (bounded_raw - range_min) / (range_max - range_min) * 100.0.
-    """
-    jc = cal.joints[joint_name]
-    if jc.norm_mode == "degrees":
-        mid = 0.5 * (jc.range_min + jc.range_max)
-        deg = (raw_ticks - mid) * 360.0 / float(cal.counts_per_rev - 1)
-        return -deg if jc.drive_mode else deg
-    if jc.norm_mode == "range_0_100":
-        bounded = min(max(raw_ticks, float(jc.range_min)), float(jc.range_max))
-        span = float(jc.range_max - jc.range_min)
-        if span <= 0.0:
-            raise ValueError(f"Invalid range for {joint_name}: {jc.range_min}..{jc.range_max}")
-        norm = (bounded - jc.range_min) / span * 100.0
-        return 100.0 - norm if jc.drive_mode else norm
-    raise ValueError(f"Unsupported norm_mode {jc.norm_mode!r} for {joint_name}")
-
-
-def hw_to_mjcf_rad(joint_name: str, hw_val: float, cal: CalibrationMap) -> float:
-    """Convert calibrated LeRobot joint value (degrees or 0..100 gripper) to MJCF radians.
-
-    Note: homing_offset is already stored in motor EEPROM by LeRobot and is never reapplied.
-    """
-    jc = cal.joints[joint_name]
-    if jc.norm_mode == "degrees":
-        return math.radians(hw_val)
-    if jc.norm_mode == "range_0_100":
-        frac = hw_val / 100.0
-        return jc.mjcf_min + frac * (jc.mjcf_max - jc.mjcf_min)
-    raise ValueError(f"Unsupported norm_mode {jc.norm_mode!r} for {joint_name}")
-
-
-def mjcf_rad_to_hw(joint_name: str, rad_val: float, cal: CalibrationMap) -> float:
-    """Convert MJCF radians to calibrated LeRobot joint value (degrees or 0..100 gripper)."""
-    jc = cal.joints[joint_name]
-    if jc.norm_mode == "degrees":
-        return math.degrees(rad_val)
-    if jc.norm_mode == "range_0_100":
-        span = jc.mjcf_max - jc.mjcf_min
-        return (rad_val - jc.mjcf_min) / span * 100.0
-    raise ValueError(f"Unsupported norm_mode {jc.norm_mode!r} for {joint_name}")
 
 
 def intersect_joint_limits(cal: CalibrationMap) -> dict[str, tuple[float, float]]:
@@ -417,7 +232,6 @@ def intersect_joint_limits(cal: CalibrationMap) -> dict[str, tuple[float, float]
     limits: dict[str, tuple[float, float]] = {}
     denom = float(cal.counts_per_rev - 1)
     margin = cal.safety_margin_rad
-
     for jname, jc in cal.joints.items():
         if jc.norm_mode == "degrees":
             mid = 0.5 * (jc.range_min + jc.range_max)
@@ -430,11 +244,78 @@ def intersect_joint_limits(cal: CalibrationMap) -> dict[str, tuple[float, float]
             hi = jc.mjcf_max - margin
         else:
             raise ValueError(f"Unsupported norm_mode {jc.norm_mode!r} for {jname}")
-
         if lo >= hi:
-            raise ValueError(
-                f"Degenerate intersected limit for {jname}: [{lo}, {hi}]"
-            )
+            raise ValueError(f"Degenerate intersected limit for {jname}: [{lo}, {hi}]")
         limits[jname] = (lo, hi)
-
     return limits
+
+
+def _coerce_scalar(value: Any, typ: type) -> Any:
+    if typ is bool:
+        if isinstance(value, bool):
+            return value
+        raise TypeError(f"Expected bool, got {type(value).__name__}: {value!r}")
+    if typ in (int, float, str):
+        return typ(value)
+    return value
+
+
+def load_policy_config(
+    cls: type[T],
+    yaml_path: str | Path | None = None,
+    overrides: dict[str, Any] | None = None,
+) -> T:
+    """Load a policy config dataclass: defaults -> YAML file -> CLI overrides."""
+    hints = get_type_hints(cls)
+    valid = {f.name for f in fields(cls)}
+    merged: dict[str, Any] = {}
+
+    if yaml_path is not None:
+        path = Path(yaml_path)
+        if not path.exists():
+            raise FileNotFoundError(f"Policy config not found: {path}")
+        raw = yaml.safe_load(path.read_text()) or {}
+        if not isinstance(raw, dict):
+            raise ValueError(f"Policy config must be a YAML mapping: {path}")
+        unknown = sorted(set(raw) - valid)
+        if unknown:
+            raise ValueError(f"Unknown {cls.__name__} keys in {path}: {', '.join(unknown)}")
+        merged.update(raw)
+
+    if overrides:
+        unknown = sorted(set(overrides) - valid)
+        if unknown:
+            raise ValueError(f"Unknown {cls.__name__} override keys: {', '.join(unknown)}")
+        for k, v in overrides.items():
+            if v is not None:
+                merged[k] = v
+
+    coerced = {k: _coerce_scalar(v, hints[k]) for k, v in merged.items()}
+    return cls(**coerced)
+
+
+def parse_policy_cli(
+    cls: type[T],
+    argv: list[str] | None = None,
+    *,
+    description: str = "",
+) -> T:
+    """Parse --config <yaml> plus auto-generated CLI flags for every dataclass field."""
+    hints = get_type_hints(cls)
+    parser = argparse.ArgumentParser(description=description)
+    parser.add_argument("--config", type=str, default=None, help="Path to policy YAML config.")
+
+    for f in fields(cls):
+        flag = f"--{f.name.replace('_', '-')}"
+        typ = hints[f.name]
+        help_text = f"(default: {f.default})"
+        if typ is bool:
+            parser.add_argument(flag, dest=f.name, action=argparse.BooleanOptionalAction, default=None, help=help_text)
+        elif typ in (int, float, str):
+            parser.add_argument(flag, dest=f.name, type=typ, default=None, help=help_text)
+        else:
+            raise TypeError(f"Unsupported CLI field type for {cls.__name__}.{f.name}: {typ}")
+
+    ns = parser.parse_args(argv)
+    overrides = {f.name: getattr(ns, f.name) for f in fields(cls) if getattr(ns, f.name) is not None}
+    return load_policy_config(cls, yaml_path=ns.config, overrides=overrides)

@@ -1,25 +1,20 @@
-seed: 1234
-dr_enabled: false
-frame_stack: 2
-num_envs: 4
-rollout_steps: 128
-total_timesteps: 200000
-device: auto
-lr: 1.0e-4
+# PPO hyperparameters for SO101BowlingEnv
+# Override any key on the CLI, e.g.:
+#   uv run python scripts/train.py --config configs/ppo.yaml --lr 1e-4 --seed 42
+
+total_steps: 100000
+rollout_steps: 1024
+epochs: 4
+batch_size: 128
+lr: 3.0e-4
 anneal_lr: true
 gamma: 0.99
 gae_lambda: 0.95
-num_epochs: 4
-minibatch_size: 64
 clip_coef: 0.2
 vf_coef: 0.5
 ent_coef: 0.01
-aux_coef: 0.5
 max_grad_norm: 0.5
-target_kl: 0.03
-drq_pad_px: 4
-encoder_type: spatial_grid
-eval_interval_updates: 10
-eval_episodes: 10
-checkpoint_interval_updates: 25
-save_video: true
+hidden: 128
+seed: 0
+out: checkpoints/ppo.pt
+device: auto

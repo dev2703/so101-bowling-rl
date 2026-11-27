@@ -16,7 +16,7 @@ class DeliveryPhase(IntEnum):
 @dataclass
 class ScorerConfig:
     gamma: float = 0.99
-    sim_dt: float = 0.005
+    sim_dt: float = 0.002
     ball_radius: float = 0.0485
     staging_clearance_m: float = 0.055
     foul_line_x: float = 0.44
@@ -30,7 +30,7 @@ class ScorerConfig:
     sep_duration_s: float = 0.025
     wobble_tilt_deg: float = 12.0
     full_fall_tilt_deg: float = 45.0
-    min_wobble_substeps: int = 4
+    min_wobble_substeps: int = 10
     off_table_z_m: float = -0.05
     quiet_vel_mps: float = 0.02
     quiet_dwell_s: float = 0.25
@@ -60,7 +60,7 @@ class SubstepSnapshot:
     arm_pin_contact: bool
     table_slam: bool
     ball_pin_contacts: tuple[bool, bool, bool]
-    pin_pin_contacts: tuple[tuple[bool, bool, bool], ...] | list[tuple[int, int]]
+    pin_pin_contacts: np.ndarray
     paddle_ball_surface_dist: float
 
 
@@ -130,15 +130,11 @@ class DeliveryScorer:
             return float(cfg.w_stage_phi + cfg.w_push_phi)
         paddle = np.asarray(paddle_pos)
         distance_to_stage = np.linalg.norm(paddle - self.p_stage)
-        # A clearance gate suppresses reward near the ball center, and the
-        # alignment term peaks at the anchored waypoint behind the ball.
         clearance = np.linalg.norm(paddle - self.ball_init_pos)
-        clearance_gate = np.clip(
-            (clearance - cfg.ball_radius) / cfg.staging_clearance_m, 0.0, 1.0
-        )
-        clearance_gate = clearance_gate**2 * (3.0 - 2.0 * clearance_gate)
-        alignment = np.exp(-0.5 * (distance_to_stage / cfg.staging_clearance_m)**2)
-        return float(cfg.w_stage_phi * clearance_gate * alignment)
+        gate = np.clip((clearance - cfg.ball_radius) / cfg.staging_clearance_m, 0.0, 1.0)
+        gate = gate**2 * (3.0 - 2.0 * gate)
+        alignment = np.exp(-0.5 * (distance_to_stage / cfg.staging_clearance_m) ** 2)
+        return float(cfg.w_stage_phi * gate * alignment)
 
     def _invalidate(self, reason: str) -> None:
         if self.phase != DeliveryPhase.INVALID:
@@ -154,12 +150,12 @@ class DeliveryScorer:
 
     def _track_impacts(self, snap: SubstepSnapshot) -> None:
         self.pin_impacted |= np.asarray(snap.ball_pin_contacts, dtype=bool)
-        raw_contacts = snap.pin_pin_contacts
-        if isinstance(raw_contacts, np.ndarray) and raw_contacts.shape == (3, 3):
+        c = np.asarray(snap.pin_pin_contacts, dtype=bool)
+        if c.shape == (3, 3):
             p0, p1, p2 = bool(self.pin_impacted[0]), bool(self.pin_impacted[1]), bool(self.pin_impacted[2])
-            c01 = bool(raw_contacts[0, 1] or raw_contacts[1, 0])
-            c02 = bool(raw_contacts[0, 2] or raw_contacts[2, 0])
-            c12 = bool(raw_contacts[1, 2] or raw_contacts[2, 1])
+            c01 = bool(c[0, 1] or c[1, 0])
+            c02 = bool(c[0, 2] or c[2, 0])
+            c12 = bool(c[1, 2] or c[2, 1])
             for _ in range(2):
                 if c01:
                     p0 = p1 = p0 or p1
@@ -167,29 +163,7 @@ class DeliveryScorer:
                     p0 = p2 = p0 or p2
                 if c12:
                     p1 = p2 = p1 or p2
-            self.pin_impacted[0], self.pin_impacted[1], self.pin_impacted[2] = p0, p1, p2
-        else:
-            contacts = np.asarray(raw_contacts)
-            if contacts.shape == (3, 3):
-                p0, p1, p2 = bool(self.pin_impacted[0]), bool(self.pin_impacted[1]), bool(self.pin_impacted[2])
-                c01 = bool(contacts[0, 1] or contacts[1, 0])
-                c02 = bool(contacts[0, 2] or contacts[2, 0])
-                c12 = bool(contacts[1, 2] or contacts[2, 1])
-                for _ in range(2):
-                    if c01:
-                        p0 = p1 = p0 or p1
-                    if c02:
-                        p0 = p2 = p0 or p2
-                    if c12:
-                        p1 = p2 = p1 or p2
-                self.pin_impacted[0], self.pin_impacted[1], self.pin_impacted[2] = p0, p1, p2
-            else:
-                # A three-pin connected component needs at most two propagation passes.
-                for _ in range(2):
-                    for i, j in contacts:
-                        self.pin_impacted[i] = self.pin_impacted[j] = (
-                            self.pin_impacted[i] or self.pin_impacted[j]
-                        )
+            self.pin_impacted[:] = (p0, p1, p2)
 
         tilts = self._tilts_deg(snap.pin_up_vectors)
         self.pin_peak_tilt_deg = np.maximum(
@@ -233,17 +207,10 @@ class DeliveryScorer:
             self._invalidate("double_tap_restrike")
 
         if self.phase == DeliveryPhase.RELEASED:
-            # A separated ball is beyond legal forward reach once its rear
-            # surface has cleared the arm's foul boundary.
             self._left_reach |= ball_x - cfg.ball_radius > cfg.foul_line_x
-            ball_off = float(snap.ball_pos[2]) < cfg.off_table_z_m
-            ball_done = ball_off or float(np.linalg.norm(snap.ball_vel[:2])) < cfg.quiet_vel_mps
-            pins_off = snap.pin_positions[:, 2] < cfg.off_table_z_m
-            pins_done = bool(np.all(pins_off | (snap.pin_speeds < cfg.quiet_vel_mps)))
-            if ball_done and pins_done:
-                self._quiet_steps += 1
-            else:
-                self._quiet_steps = 0
+            ball_done = float(snap.ball_pos[2]) < cfg.off_table_z_m or float(np.linalg.norm(snap.ball_vel[:2])) < cfg.quiet_vel_mps
+            pins_done = bool(np.all((snap.pin_positions[:, 2] < cfg.off_table_z_m) | (snap.pin_speeds < cfg.quiet_vel_mps)))
+            self._quiet_steps = self._quiet_steps + 1 if (ball_done and pins_done) else 0
 
     def _update_push(self, snap: SubstepSnapshot, ball_xy: np.ndarray, ball_x: float) -> None:
         cfg = self.config
@@ -254,8 +221,8 @@ class DeliveryScorer:
             elif ball_x > cfg.rack_x_nom - 0.05:
                 self._invalidate("late_release_past_rack")
             else:
-                displacement = float(np.dot(ball_xy - self.contact_start_ball_xy, self.u_aim))
-                self.max_contact_fwd_disp = max(self.max_contact_fwd_disp, displacement)
+                disp = float(np.dot(ball_xy - self.contact_start_ball_xy, self.u_aim))
+                self.max_contact_fwd_disp = max(self.max_contact_fwd_disp, disp)
                 self.v_out = np.array(snap.ball_vel[:2], dtype=float, copy=True)
             return
 
@@ -282,26 +249,22 @@ class DeliveryScorer:
         self._phi_prev = phi_next
         return float(reward - self.config.w_action_jerk * np.sum(delta**2))
 
-    def should_end_delivery(self, elapsed_delivery_s, delivery_timeout_s) -> tuple[bool, str | None]:
+    def should_end_delivery(self, elapsed_delivery_s: float, delivery_timeout_s: float) -> tuple[bool, str | None]:
         if self.phase == DeliveryPhase.INVALID:
             return True, self.invalid_reason
-        if self.phase == DeliveryPhase.RELEASED:
-            if self._latest_ball_x >= self.config.release_line_x or self._left_reach:
-                return True, "released"
+        if self.phase == DeliveryPhase.RELEASED and (self._latest_ball_x >= self.config.release_line_x or self._left_reach):
+            return True, "released"
         if elapsed_delivery_s >= delivery_timeout_s:
             return True, "delivery_timeout"
         return False, None
 
-    def is_coast_settled(self, coast_elapsed_s) -> tuple[bool, bool]:
+    def is_coast_settled(self, coast_elapsed_s: float) -> tuple[bool, bool]:
         if self.phase == DeliveryPhase.INVALID:
             return True, False
         if self.phase == DeliveryPhase.APPROACH:
-            if coast_elapsed_s >= self.config.quiet_dwell_s:
-                return True, False
-            return False, False
-        if self.phase == DeliveryPhase.RELEASED:
-            if self._quiet_steps * self.config.sim_dt >= self.config.quiet_dwell_s:
-                return True, False
+            return (coast_elapsed_s >= self.config.quiet_dwell_s), False
+        if self.phase == DeliveryPhase.RELEASED and self._quiet_steps * self.config.sim_dt >= self.config.quiet_dwell_s:
+            return True, False
         timed_out = coast_elapsed_s >= self.config.max_coast_s
         return timed_out, timed_out
 
@@ -322,8 +285,7 @@ class DeliveryScorer:
                 angle = float(np.arctan2(abs(lateral), forward))
             if speed >= cfg.min_launch_speed_mps:
                 launch_reward = cfg.w_contact_speed * min(speed / cfg.target_launch_speed_mps, 1.0)
-                launch_reward += cfg.w_launch_angle * float(np.exp(-0.5 * (angle / cfg.aim_sigma_rad)**2))
-
+                launch_reward += cfg.w_launch_angle * float(np.exp(-0.5 * (angle / cfg.aim_sigma_rad) ** 2))
             off_mask = self.pin_impacted & (final_snap.pin_positions[:, 2] < cfg.off_table_z_m)
             tilt = self._tilts_deg(final_snap.pin_up_vectors)
             full_mask = off_mask | (self.pin_impacted & (tilt + 1e-9 >= cfg.full_fall_tilt_deg))
@@ -331,9 +293,7 @@ class DeliveryScorer:
             full = int(np.count_nonzero(full_mask))
             wobble = int(np.count_nonzero(self.pin_wobbled & ~full_mask))
             credited = full + wobble
-            pin_reward = cfg.r_pin_credit * credited
-            if credited == 3:
-                pin_reward += cfg.r_strike_bonus
+            pin_reward = cfg.r_pin_credit * credited + (cfg.r_strike_bonus if credited == 3 else 0.0)
         elif self.phase == DeliveryPhase.INVALID:
             penalty = cfg.r_illegal_penalty
         else:
