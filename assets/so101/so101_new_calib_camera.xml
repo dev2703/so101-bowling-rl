@@ -7,7 +7,6 @@
   <default>
     <default class="so101_new_calib">
       <joint damping="1" frictionloss="0.1" armature="0.005"/>
-      <position kp="50"/>
       <default class="visual">
         <geom type="mesh" contype="0" conaffinity="0" group="2"/>
       </default>
