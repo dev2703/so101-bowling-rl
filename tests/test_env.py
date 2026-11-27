@@ -268,3 +268,16 @@ def test_make_vec_env_inherits_cfg_dr_enabled_by_default():
         obs_2a = subproc_env.reset(seed=0)
         obs_2b = subproc_env.reset(seed=10)
         assert not np.array_equal(obs_2a["privileged_state"], obs_2b["privileged_state"])
+
+
+@pytest.mark.smoke
+def test_headless_mujoco_5_step_smoke():
+    with SO101BowlingEnv(render_rgb=False) as env:
+        obs, info = env.reset(seed=0)
+        assert env.observation_space.contains(obs)
+        assert isinstance(info, dict)
+        for _ in range(5):
+            obs, reward, terminated, truncated, _ = env.step(ZERO)
+            assert env.observation_space.contains(obs)
+            assert np.isfinite(reward)
+            assert not terminated and not truncated

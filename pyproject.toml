@@ -40,5 +40,6 @@ packages = ["src/so101_bowling"]
 testpaths = ["tests"]
 addopts = "-q"
 markers = [
+    "smoke: fast headless MuJoCo smoke checks (< 2 s)",
     "hardware: tests requiring physical SO-101 arm or live cameras",
 ]
