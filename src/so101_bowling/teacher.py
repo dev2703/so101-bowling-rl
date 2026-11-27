@@ -425,6 +425,11 @@ def train_teacher_ppo(
                     base_seed=cfg.seed,
                 )
             )
+            if abs(vec_env.scorer_gamma - cfg.gamma) > 1e-6:
+                raise ValueError(
+                    f"Scorer gamma ({vec_env.scorer_gamma}) must match "
+                    f"TeacherPPOConfig.gamma ({cfg.gamma})"
+                )
             next_obs = vec_env.reset(seed=cfg.seed)
             ep_outcomes: list[dict[str, Any]] = []
             t_start = perf_counter()
@@ -490,10 +495,7 @@ def train_teacher_ppo(
                     b_adv = (b_adv - b_adv.mean()) / (b_adv.std() + 1e-8)
 
                 agent.train()
-                pg_losses: list[float] = []
-                v_losses: list[float] = []
-                ent_losses: list[float] = []
-                kls: list[float] = []
+                mb_metrics: list[Tensor] = []
                 stop_early = False
                 for _ in range(cfg.num_epochs):
                     perm = rng.permutation(batch_size)
@@ -505,8 +507,7 @@ def train_teacher_ppo(
                         logratio = newlogp - b_logp[mb]
                         ratio = logratio.exp()
                         with torch.no_grad():
-                            approx_kl = float(((ratio - 1.0) - logratio).mean().cpu())
-                            kls.append(approx_kl)
+                            approx_kl_t = ((ratio - 1.0) - logratio).mean()
 
                         pg1 = -b_adv[mb] * ratio
                         pg2 = -b_adv[mb] * torch.clamp(
@@ -525,14 +526,19 @@ def train_teacher_ppo(
                         optimizer.step()
                         _assert_finite_params(f"teacher.upd_{update}", agent.parameters())
 
-                        pg_losses.append(float(pg_loss.detach().cpu()))
-                        v_losses.append(float(v_loss.detach().cpu()))
-                        ent_losses.append(float(ent_loss.detach().cpu()))
-                        if cfg.target_kl is not None and approx_kl > 1.5 * cfg.target_kl:
+                        metric_row = (approx_kl_t, pg_loss, v_loss, ent_loss)
+                        mb_metrics.append(torch.stack([t.detach() for t in metric_row]))
+                        if (
+                            cfg.target_kl is not None
+                            and float(approx_kl_t.cpu()) > 1.5 * cfg.target_kl
+                        ):
                             stop_early = True
                             break
                     if stop_early:
                         break
+
+                # Single host transfer for every minibatch metric of this update.
+                kls, pg_losses, v_losses, ent_losses = torch.stack(mb_metrics, dim=1).cpu().tolist()
 
                 elapsed = max(1e-6, perf_counter() - t_start)
                 tps = global_step / elapsed

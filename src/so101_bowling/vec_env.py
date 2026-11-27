@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import multiprocessing as mp
 import os
-from typing import Any
+import traceback
+from contextlib import contextmanager
+from typing import Any, Iterator
 
 import numpy as np
 
@@ -14,6 +16,21 @@ from so101_bowling.env import SO101BowlingEnv
 
 def _stack_obs(obs_list: list[dict[str, np.ndarray]]) -> dict[str, np.ndarray]:
     return {k: np.stack([obs[k] for obs in obs_list], axis=0) for k in obs_list[0]}
+
+
+@contextmanager
+def _forward_worker_errors(conn: Any) -> Iterator[None]:
+    """Send a worker failure's traceback to the parent before re-raising it."""
+    try:
+        yield
+    except EOFError:
+        return
+    except BaseException:
+        try:
+            conn.send(("__worker_error__", traceback.format_exc()))
+        except Exception:
+            pass  # Parent pipe already closed; the re-raise still reports it.
+        raise
 
 
 def _worker_loop(
@@ -29,7 +46,7 @@ def _worker_loop(
 
     cv2.setNumThreads(1)
 
-    with conn, SO101BowlingEnv(
+    with conn, _forward_worker_errors(conn), SO101BowlingEnv(
         cfg=cfg,
         dr_enabled=dr_enabled,
         render_rgb=render_rgb,
@@ -175,24 +192,38 @@ class SubprocVecBowlingEnv:
                     else:
                         os.environ[name] = value
 
-            spaces_list = [parent.recv() for parent in self._parents]
+            spaces_list = [self._recv(parent, idx) for idx, parent in enumerate(self._parents)]
             self.observation_space, self.action_space, self.scorer_gamma = spaces_list[0]
         except BaseException:
             self.close()
             raise
 
+    def _recv(self, conn: Any, idx: int) -> Any:
+        try:
+            msg = conn.recv()
+        except EOFError as exc:
+            proc = self._procs[idx]
+            proc.join(timeout=1.0)  # Let a dying worker publish its exit code.
+            raise RuntimeError(
+                f"SubprocVecBowlingEnv worker {idx} failed:\n"
+                f"pipe closed without a reply (exitcode={proc.exitcode})"
+            ) from exc
+        if isinstance(msg, tuple) and len(msg) == 2 and msg[0] == "__worker_error__":
+            raise RuntimeError(f"SubprocVecBowlingEnv worker {idx} failed:\n{msg[1]}")
+        return msg
+
     def reset(self, seed: int | None = None) -> dict[str, np.ndarray]:
         for idx, parent in enumerate(self._parents):
             worker_seed = None if seed is None else seed + idx
             parent.send(("reset", worker_seed))
-        return _stack_obs([parent.recv() for parent in self._parents])
+        return _stack_obs([self._recv(parent, idx) for idx, parent in enumerate(self._parents)])
 
     def step(
         self, actions: np.ndarray
     ) -> tuple[dict[str, np.ndarray], np.ndarray, np.ndarray, np.ndarray, list[dict[str, Any]]]:
         for idx, parent in enumerate(self._parents):
             parent.send(("step", np.asarray(actions[idx], dtype=np.float32)))
-        results = [parent.recv() for parent in self._parents]
+        results = [self._recv(parent, idx) for idx, parent in enumerate(self._parents)]
         obs = _stack_obs([r[0] for r in results])
         rewards = np.asarray([r[1] for r in results], dtype=np.float32)
         terminated = np.asarray([r[2] for r in results], dtype=bool)

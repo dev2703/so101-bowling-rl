@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
@@ -246,6 +247,7 @@ def test_ppo_end_to_end_smoke_train_eval_and_ablation(tmp_path: Path) -> None:
         eval_episodes=1,
         checkpoint_interval_updates=2,
         save_video=False,
+        max_grad_norm=1.0e-4,
     )
     wcfg = load_config()
     run_dir = tmp_path / "ppo_smoke"
@@ -254,6 +256,12 @@ def test_ppo_end_to_end_smoke_train_eval_and_ablation(tmp_path: Path) -> None:
     assert summary["global_step"] == 64
     for key in ("policy_loss", "value_loss", "aux_loss", "approx_kl", "post_update_kl"):
         assert np.isfinite(summary["last_metrics"][key])
+    rows = [json.loads(line) for line in (run_dir / "metrics.jsonl").read_text().splitlines()]
+    assert len(rows) == 2
+    for row in rows:
+        for key in ("grad_norm_actor", "grad_norm_critic", "grad_norm_aux"):
+            # Exceeding the tiny clip threshold shows the norm is measured before clipping.
+            assert np.isfinite(row[key]) and row[key] > ppo_cfg.max_grad_norm
     assert (run_dir / "best_actor.pt").exists()
     assert (run_dir / "final_actor.pt").exists()
     assert (run_dir / "latest.pt").exists()
@@ -357,7 +365,12 @@ def test_subproc_startup_failure_cleans_up(
     ctx.Process.side_effect = procs
     monkeypatch.setattr(vec_env.mp, "get_context", Mock(return_value=ctx))
 
-    with pytest.raises(EOFError, match="worker startup failed"):
+    expected, match = (
+        (EOFError, "worker startup failed")
+        if failure_stage == "spawn"
+        else (RuntimeError, "worker 1 failed:\npipe closed without a reply")
+    )
+    with pytest.raises(expected, match=match):
         vec_env.SubprocVecBowlingEnv(num_envs=2, cfg=load_config())
 
     for parent, child in pipes:
@@ -371,8 +384,19 @@ def test_subproc_startup_failure_cleans_up(
     if failure_stage == "spawn":
         procs[1].join.assert_not_called()
     else:
-        procs[1].join.assert_called_once_with(timeout=5.0)
+        assert [call.kwargs["timeout"] for call in procs[1].join.call_args_list] == [1.0, 5.0]
     assert [os.environ.get(name) for name in thread_vars] == ["6", None, None, None]
+
+
+def test_subproc_worker_exception_surfaces_traceback() -> None:
+    with vec_env.SubprocVecBowlingEnv(num_envs=2, cfg=load_config(), render_rgb=False) as env:
+        env.reset(seed=0)
+        actions = np.zeros((2, 4), dtype=np.float32)
+        actions[1, 0] = np.nan
+        with pytest.raises(RuntimeError, match="worker 1 failed") as excinfo:
+            env.step(actions)
+    assert "Traceback (most recent call last)" in str(excinfo.value)
+    assert "ValueError" in str(excinfo.value)
 
 
 @pytest.mark.parametrize(
@@ -446,8 +470,6 @@ def test_preflight_ppo_passes_and_detects_nan_or_zero_aux(
 
 
 def test_evaluate_actor_steps_eval_aux_and_eval_ppo_cli(tmp_path: Path) -> None:
-    import json
-
     wcfg = load_config()
     agent = AsymmetricPPOAgent(frame_stack=2, encoder_type="spatial_grid")
     ev = evaluate_actor(

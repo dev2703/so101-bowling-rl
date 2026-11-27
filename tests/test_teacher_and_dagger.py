@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import numpy as np
 import pytest
 
+from so101_bowling import teacher as teacher_mod
 from so101_bowling.config import load_config
 from so101_bowling.scorer import DeliveryPhase, DeliveryScorer, ScorerConfig
 from so101_bowling.teacher import (
@@ -74,6 +76,20 @@ def test_teacher_ppo_smoke_train_save_and_load(tmp_path: Path) -> None:
     assert act.shape == (4,)
     assert np.isfinite(act).all()
     assert np.all(np.abs(act) <= 1.0)
+
+
+def test_train_teacher_rejects_scorer_gamma_mismatch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env = MagicMock(scorer_gamma=0.97)
+    env.__enter__.return_value = env
+    monkeypatch.setattr(teacher_mod, "make_vec_env", lambda **kw: env)
+    cfg = TeacherPPOConfig(num_envs=1, device="cpu", gamma=0.99, bc_warmup_episodes=0)
+
+    with pytest.raises(ValueError, match=r"Scorer gamma \(0\.97\) must match"):
+        train_teacher_ppo(cfg=cfg, workspace_cfg=load_config(), run_dir=tmp_path)
+    env.reset.assert_not_called()
+    env.__exit__.assert_called_once()
 
 
 @pytest.mark.parametrize(

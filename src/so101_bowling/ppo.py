@@ -108,6 +108,12 @@ def _module_grad_and_param_stats(params: Iterable[nn.Parameter]) -> tuple[float,
     return math.sqrt(grad_sq_sum), max_abs_param
 
 
+def _module_grad_norm(module: nn.Module) -> Tensor:
+    """L2 norm over a module's existing gradients, left on device as a 0-d tensor."""
+    norms = [torch.linalg.vector_norm(p.grad) for p in module.parameters() if p.grad is not None]
+    return torch.linalg.vector_norm(torch.stack(norms))
+
+
 @dataclass(frozen=True)
 class PPOConfig:
     seed: int = 0
@@ -1130,12 +1136,7 @@ def train_ppo(
                     flat["advantages"] = (adv - adv.mean()) / (adv.std() + 1e-8)
 
                 agent.train()
-                clipfracs: list[float] = []
-                pg_losses: list[float] = []
-                v_losses: list[float] = []
-                ent_losses: list[float] = []
-                aux_losses: list[float] = []
-                pre_kls: list[float] = []
+                mb_metrics: list[Tensor] = []
 
                 stop_early = False
                 pad = ppo_cfg.drq_pad_px
@@ -1182,11 +1183,8 @@ def train_ppo(
                         ratio = logratio.exp()
 
                         with torch.no_grad():
-                            approx_kl = float(((ratio - 1.0) - logratio).mean().cpu())
-                            pre_kls.append(approx_kl)
-                            clipfracs.append(
-                                float(((ratio - 1.0).abs() > ppo_cfg.clip_coef).float().mean().cpu())
-                            )
+                            approx_kl_t = ((ratio - 1.0) - logratio).mean()
+                            clipfrac_t = ((ratio - 1.0).abs() > ppo_cfg.clip_coef).float().mean()
 
                         pg_loss1 = -mb_adv * ratio
                         pg_loss2 = -mb_adv * torch.clamp(
@@ -1227,24 +1225,44 @@ def train_ppo(
 
                         optimizer.zero_grad()
                         loss.backward()
+                        # Measured before clip_grad_norm_ rescales the gradients in place.
+                        module_grad_norms = [
+                            _module_grad_norm(m) for m in (agent.actor, agent.critic, agent.aux_head)
+                        ]
                         grad_norm = nn.utils.clip_grad_norm_(agent.parameters(), ppo_cfg.max_grad_norm)
                         _assert_finite_tensor(f"ppo.update_{update}.grad_norm", grad_norm)
                         optimizer.step()
                         _assert_finite_params(f"ppo.update_{update}", agent.parameters())
 
-                        pg_losses.append(float(pg_loss.detach().cpu()))
-                        v_losses.append(float(v_loss.detach().cpu()))
-                        ent_losses.append(float(ent_loss.detach().cpu()))
-                        aux_losses.append(float(aux_loss.detach().cpu()))
+                        metric_row = (approx_kl_t, clipfrac_t, pg_loss, v_loss, ent_loss, aux_loss)
+                        mb_metrics.append(
+                            torch.stack([t.detach() for t in metric_row] + module_grad_norms)
+                        )
 
-                        if ppo_cfg.target_kl is not None and approx_kl > 1.5 * ppo_cfg.target_kl:
+                        if (
+                            ppo_cfg.target_kl is not None
+                            and float(approx_kl_t.cpu()) > 1.5 * ppo_cfg.target_kl
+                        ):
                             stop_early = True
                             break
                     if stop_early:
                         break
 
+                # Single host transfer for every minibatch metric of this update.
+                (
+                    pre_kls,
+                    clipfracs,
+                    pg_losses,
+                    v_losses,
+                    ent_losses,
+                    aux_losses,
+                    actor_grad_norms,
+                    critic_grad_norms,
+                    aux_grad_norms,
+                ) = torch.stack(mb_metrics, dim=1).cpu().tolist()
+
                 # Measure post-update KL across rollout batch (captures policy drift from aux loss too).
-                post_kl_sum = 0.0
+                post_kl_sums: list[Tensor] = []
                 with torch.no_grad():
                     for start in range(0, batch_size, minibatch_size):
                         mb_inds = slice(start, min(start + minibatch_size, batch_size))
@@ -1256,7 +1274,11 @@ def train_ppo(
                             action=mb_act,
                         )
                         lr_diff = post_logp - mb_logp
-                        post_kl_sum += float(((lr_diff.exp() - 1.0) - lr_diff).sum().cpu())
+                        post_kl_sums.append(((lr_diff.exp() - 1.0) - lr_diff).sum())
+                # Add in Python (float64, which MPS lacks on device) after one host transfer.
+                post_kl_sum = 0.0
+                for mb_kl_sum in torch.stack(post_kl_sums).cpu().tolist():
+                    post_kl_sum += mb_kl_sum
                 post_update_kl = post_kl_sum / max(1, batch_size)
 
                 elapsed = max(1e-6, perf_counter() - t_start)
@@ -1273,6 +1295,9 @@ def train_ppo(
                     "approx_kl": float(np.mean(pre_kls)),
                     "post_update_kl": post_update_kl,
                     "clipfrac": float(np.mean(clipfracs)),
+                    "grad_norm_actor": float(np.mean(actor_grad_norms)),
+                    "grad_norm_critic": float(np.mean(critic_grad_norms)),
+                    "grad_norm_aux": float(np.mean(aux_grad_norms)),
                     "explained_variance": _explained_variance(flat["values"], flat["returns"]),
                     "transitions_per_sec": tps,
                     "rollout_episodes": len(ep_outcomes),
