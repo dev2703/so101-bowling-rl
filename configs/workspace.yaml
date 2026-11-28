@@ -37,8 +37,6 @@ pin:
   body_rgba: [0.96, 0.94, 0.88, 1.0]
   stripe_rgba: [0.82, 0.12, 0.12, 1.0]
   mesh_dir: assets/bowling
-  num_radial_segments: 32
-  num_height_segments: 48
 
 table:
   desk_x_range: [-0.15, 0.80]
@@ -56,8 +54,6 @@ table:
   pin_desk_friction: [0.45, 0.005, 0.0005]
 
 camera:
-  render_height: 64
-  render_width: 112
   wrist_pos: [0.045, 0.0, -0.028]
   wrist_xyaxes: [0.0, -1.0, 0.0, 0.990, 0.0, -0.140]
   wrist_fovy: 72.0
@@ -80,7 +76,7 @@ delivery:
   sep_dist_m: 0.015
   sep_duration_s: 0.025
   wobble_tilt_deg: 12.0
-  full_fall_tilt_deg: 45.0
+  full_fall_tilt_deg: 46.0
   wobble_duration_s: 0.02
   off_table_z_m: -0.05
   quiet_vel_mps: 0.02
@@ -89,39 +85,32 @@ delivery:
 
 reward:
   gamma: 0.99
-  w_stage_phi: 0.40
-  w_push_phi: 0.60
-  w_contact_speed: 0.60
-  w_launch_angle: 0.60
+  w_stage_phi: 1.0
+  w_push_phi: 1.5
+  r_first_contact: 1.0
+  w_contact_speed: 1.0
+  w_launch_angle: 1.0
+  w_ball_approach: 1.5
+  ball_approach_sigma_m: 0.08
+  w_partial_tilt: 1.0
+  w_step_penalty: 0.01
   w_action_jerk: 0.005
   r_pin_credit: 5.0
   r_strike_bonus: 5.0
   r_illegal_penalty: -2.0
+  r_soft_fault_penalty: -0.5
+  r_timeout_penalty: -0.5
 
 dr:
-  enabled: false
+  enabled: true
   ball_spawn_dx: 0.03
   ball_spawn_dy: 0.05
   ball_mass_range: [0.030, 0.120]
   pin_mass_range: [0.015, 0.060]
-  pin_pos_jitter: 0.006
+  rack_shift_x: 0.04
+  rack_shift_y: 0.08
+  pin_pos_jitter: 0.008
+  pin_init_tilt_deg: 3.0
   pad_roll_friction_scale: [0.6, 1.8]
   desk_roll_friction_scale: [0.6, 1.8]
   slide_friction_scale: [0.7, 1.4]
-  joint_damping_scale: [0.7, 1.4]
-  actuator_kp_scale: [0.85, 1.15]
-  tripod_pos_jitter: 0.025
-  tripod_target_jitter: 0.015
-  tripod_fovy_jitter: 2.5
-  wrist_pos_jitter: 0.004
-  wrist_fovy_jitter: 2.5
-  light_pos_jitter: 0.20
-  light_intensity_scale: [0.75, 1.25]
-  color_jitter: 0.08
-  num_distractors: 6
-  brightness_delta: 0.15
-  contrast_scale: [0.85, 1.15]
-  gamma_range: [0.88, 1.12]
-  saturation_scale: [0.85, 1.15]
-  noise_std: 4.0
-  max_shift_px: 3

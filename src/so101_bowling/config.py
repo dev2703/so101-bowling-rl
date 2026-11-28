@@ -123,7 +123,7 @@ class DeliveryConfig:
     sep_dist_m: float = 0.015
     sep_duration_s: float = 0.025
     wobble_tilt_deg: float = 12.0
-    full_fall_tilt_deg: float = 45.0
+    full_fall_tilt_deg: float = 46.0
     wobble_duration_s: float = 0.02
     off_table_z_m: float = -0.05
     quiet_vel_mps: float = 0.02
@@ -134,14 +134,39 @@ class DeliveryConfig:
 @dataclass(frozen=True)
 class RewardConfig:
     gamma: float = 0.99
-    w_stage_phi: float = 0.40
-    w_push_phi: float = 0.60
-    w_contact_speed: float = 0.60
-    w_launch_angle: float = 0.60
+    w_stage_phi: float = 1.0
+    w_push_phi: float = 1.5
+    r_first_contact: float = 1.0
+    w_contact_speed: float = 1.0
+    w_launch_angle: float = 1.0
+    w_ball_approach: float = 1.5
+    ball_approach_sigma_m: float = 0.08
+    w_partial_tilt: float = 1.0
+    w_step_penalty: float = 0.01
     w_action_jerk: float = 0.005
     r_pin_credit: float = 5.0
     r_strike_bonus: float = 5.0
     r_illegal_penalty: float = -2.0
+    r_soft_fault_penalty: float = -0.5
+    r_timeout_penalty: float = -0.5
+
+
+@dataclass(frozen=True)
+class DRConfig:
+    """Per-episode physics domain randomization ranges."""
+
+    enabled: bool = True
+    ball_spawn_dx: float = 0.03
+    ball_spawn_dy: float = 0.05
+    ball_mass_range: tuple[float, float] = (0.030, 0.120)
+    pin_mass_range: tuple[float, float] = (0.015, 0.060)
+    rack_shift_x: float = 0.04
+    rack_shift_y: float = 0.08
+    pin_pos_jitter: float = 0.008
+    pin_init_tilt_deg: float = 3.0
+    pad_roll_friction_scale: tuple[float, float] = (0.6, 1.8)
+    desk_roll_friction_scale: tuple[float, float] = (0.6, 1.8)
+    slide_friction_scale: tuple[float, float] = (0.7, 1.4)
 
 
 @dataclass(frozen=True)
@@ -153,6 +178,7 @@ class WorkspaceConfig:
     camera: CameraConfig = field(default_factory=CameraConfig)
     delivery: DeliveryConfig = field(default_factory=DeliveryConfig)
     reward: RewardConfig = field(default_factory=RewardConfig)
+    dr: DRConfig = field(default_factory=DRConfig)
 
 
 @dataclass(frozen=True)
@@ -172,12 +198,17 @@ class CalibrationMap:
     counts_per_rev: int = 4096
 
 
-def _build_section(cls: type, raw: dict[str, Any]):
+def _build_section(cls: type, raw: dict[str, Any] | None):
+    if raw is None:  # a section header with no keys keeps all defaults
+        raw = {}
+    if not isinstance(raw, dict):
+        raise ValueError(f"{cls.__name__} section must be a YAML mapping")
     valid = {f.name for f in fields(cls)}
+    unknown = sorted(map(str, set(raw) - valid))
+    if unknown:
+        raise ValueError(f"Unknown {cls.__name__} keys: {', '.join(unknown)}")
     kwargs = {}
     for k, v in raw.items():
-        if k not in valid:
-            continue
         if isinstance(v, list):
             kwargs[k] = tuple(tuple(x) if isinstance(x, list) else x for x in v)
         else:
@@ -191,6 +222,11 @@ def load_config(path: str | Path | None = None) -> WorkspaceConfig:
     if not cfg_path.exists():
         raise FileNotFoundError(f"Workspace config not found: {cfg_path}")
     raw: dict[str, Any] = yaml.safe_load(cfg_path.read_text()) or {}
+    if not isinstance(raw, dict):
+        raise ValueError(f"Workspace config must be a YAML mapping: {cfg_path}")
+    unknown = sorted(map(str, set(raw) - {f.name for f in fields(WorkspaceConfig)}))
+    if unknown:
+        raise ValueError(f"Unknown WorkspaceConfig keys in {cfg_path}: {', '.join(unknown)}")
     return WorkspaceConfig(
         robot=_build_section(RobotConfig, raw.get("robot", {})),
         ball=_build_section(BallConfig, raw.get("ball", {})),
@@ -199,6 +235,7 @@ def load_config(path: str | Path | None = None) -> WorkspaceConfig:
         camera=_build_section(CameraConfig, raw.get("camera", {})),
         delivery=_build_section(DeliveryConfig, raw.get("delivery", {})),
         reward=_build_section(RewardConfig, raw.get("reward", {})),
+        dr=_build_section(DRConfig, raw.get("dr", {})),
     )
 
 

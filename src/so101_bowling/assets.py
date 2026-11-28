@@ -40,6 +40,10 @@ class SceneEntityIds:
     pusher_geom_ids: set[int]
     arm_geom_ids: set[int]
     table_geom_ids: set[int]
+    ball_joint_qpos_addr: int
+    pin_joint_qpos_addrs: list[int]
+    pad_pair_ids: list[int]
+    desk_pair_ids: list[int]
 
 
 def pin_radius_profile(z: np.ndarray, pin_cfg: PinConfig) -> np.ndarray:
@@ -298,13 +302,15 @@ def get_scene_entity_ids(model: mujoco.MjModel) -> SceneEntityIds:
     act = lambda n: mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_ACTUATOR, n)
     body = lambda n: mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, n)
     geom = lambda n: mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, n)
+    pair = lambda n: mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_PAIR, n)
 
     active_joint_ids = [jnt(n) for n in ACTIVE_JOINTS]
     all_joint_ids = [jnt(n) for n in ALL_JOINTS]
-    pin_body_ids, pin_geom_ids, pin_qvel_addrs = [], [], []
+    pin_body_ids, pin_geom_ids, pin_qpos_addrs, pin_qvel_addrs = [], [], [], []
     for idx in range(3):
         bid = body(f"pin_{idx}")
         pin_body_ids.append(bid)
+        pin_qpos_addrs.append(int(model.jnt_qposadr[jnt(f"pin_joint_{idx}")]))
         pin_qvel_addrs.append(int(model.jnt_dofadr[jnt(f"pin_joint_{idx}")]))
         pin_geom_ids.append({g for g in range(model.ngeom) if int(model.geom_bodyid[g]) == bid})
 
@@ -336,4 +342,8 @@ def get_scene_entity_ids(model: mujoco.MjModel) -> SceneEntityIds:
         pusher_geom_ids=pusher_geom_ids,
         arm_geom_ids=arm_geom_ids,
         table_geom_ids=table_geom_ids,
+        ball_joint_qpos_addr=int(model.jnt_qposadr[jnt("ball_joint")]),
+        pin_joint_qpos_addrs=pin_qpos_addrs,
+        pad_pair_ids=[pair(f"ball_{n}_pair") for n in ("mousepad", "pad_ramp")],
+        desk_pair_ids=[pair(f"ball_{n}_pair") for n in ("desk_back", "desk_front", "desk_left", "desk_right")],
     )

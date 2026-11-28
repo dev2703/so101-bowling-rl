@@ -41,10 +41,12 @@ class SO101BowlingEnv(gym.Env):
         cal: CalibrationMap | None = None,
         scorer_cfg: ScorerConfig | None = None,
         seed: int | None = None,
+        dr: bool | None = None,
     ) -> None:
         super().__init__()
         self.cfg = cfg if cfg is not None else load_config()
         self.cal = cal if cal is not None else load_calibration()
+        self.dr_enabled = self.cfg.dr.enabled if dr is None else dr
         self._initial_seed = seed
         self._needs_reset = True
 
@@ -73,6 +75,16 @@ class SO101BowlingEnv(gym.Env):
         self._pin_vel = np.asarray(ids.pin_joint_qvel_addrs)[:, None] + np.arange(3)
         self._ft = np.zeros(6)
 
+        geom_id = lambda n: mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_GEOM, n)
+        self._pad_geoms = np.array([geom_id("mousepad"), geom_id("pad_ramp")], dtype=np.intp)
+        self._desk_geoms = np.array(
+            [geom_id(f"desk_{side}") for side in ("back", "front", "left", "right")], dtype=np.intp
+        )
+        self._nom_body_mass = self.model.body_mass.copy()
+        self._nom_body_inertia = self.model.body_inertia.copy()
+        self._nom_pair_friction = self.model.pair_friction.copy()
+        self._nom_geom_friction = self.model.geom_friction.copy()
+
         self.substeps = round(1.0 / (self.cfg.robot.control_hz * self.cfg.robot.physics_dt))
         self._control_dt = self.substeps * self.cfg.robot.physics_dt
         self.delivery_timeout_s = self.cfg.delivery.max_steps * self._control_dt
@@ -83,6 +95,7 @@ class SO101BowlingEnv(gym.Env):
                 gamma=r.gamma,
                 sim_dt=self.cfg.robot.physics_dt,
                 ball_radius=self.cfg.ball.radius,
+                pin_belly_radius=self.cfg.pin.belly_radius,
                 staging_clearance_m=d.staging_clearance_m,
                 foul_line_x=d.foul_line_x,
                 release_line_x=d.release_line_x,
@@ -102,12 +115,19 @@ class SO101BowlingEnv(gym.Env):
                 max_coast_s=d.max_coast_s,
                 w_stage_phi=r.w_stage_phi,
                 w_push_phi=r.w_push_phi,
+                r_first_contact=r.r_first_contact,
                 w_contact_speed=r.w_contact_speed,
                 w_launch_angle=r.w_launch_angle,
+                w_ball_approach=r.w_ball_approach,
+                ball_approach_sigma_m=r.ball_approach_sigma_m,
+                w_partial_tilt=r.w_partial_tilt,
+                w_step_penalty=r.w_step_penalty,
                 w_action_jerk=r.w_action_jerk,
                 r_pin_credit=r.r_pin_credit,
                 r_strike_bonus=r.r_strike_bonus,
                 r_illegal_penalty=r.r_illegal_penalty,
+                r_soft_fault_penalty=r.r_soft_fault_penalty,
+                r_timeout_penalty=r.r_timeout_penalty,
             )
         self.scorer = DeliveryScorer(replace(scorer_cfg, sim_dt=self.cfg.robot.physics_dt))
 
@@ -117,11 +137,20 @@ class SO101BowlingEnv(gym.Env):
     def reset(self, *, seed: int | None = None, options: dict | None = None):
         super().reset(seed=self._initial_seed if seed is None else seed)
         self._initial_seed = None
+        self._restore_nominal_model()
+        if self.dr_enabled:
+            self._randomize_model()
+        # mj_setConst overwrites data.qpos, so it must run before the state is initialized.
+        mujoco.mj_setConst(self.model, self.data)
         mujoco.mj_resetData(self.model, self.data)
         self.data.qpos[self._all_qpos_addrs] = self._home
         self._hold(self._home[: len(ACTIVE_JOINTS)])
+        if self.dr_enabled:
+            self._randomize_positions()
         mujoco.mj_forward(self.model, self.data)
         mujoco.mj_step(self.model, self.data, nstep=20)
+        if self.dr_enabled:
+            self._tilt_pins()
         self.data.time = 0.0
         mujoco.mj_forward(self.model, self.data)
 
@@ -133,6 +162,72 @@ class SO101BowlingEnv(gym.Env):
         self._prev_delta = np.zeros(len(ACTIVE_JOINTS))
         self._needs_reset = False
         return self._observation(), {}
+
+    def _restore_nominal_model(self) -> None:
+        self.model.body_mass[:] = self._nom_body_mass
+        self.model.body_inertia[:] = self._nom_body_inertia
+        self.model.pair_friction[:] = self._nom_pair_friction
+        self.model.geom_friction[:] = self._nom_geom_friction
+
+    def _randomize_model(self) -> None:
+        """Sample ball/pin masses (inertia scaled to match) and contact friction."""
+        model, dr, ids, rng = self.model, self.cfg.dr, self.ids, self.np_random
+        mass_ranges = [dr.ball_mass_range] + [dr.pin_mass_range] * len(ids.pin_body_ids)
+        for bid, mass_range in zip((ids.ball_body_id, *ids.pin_body_ids), mass_ranges):
+            mass = float(rng.uniform(*mass_range))
+            model.body_mass[bid] = mass
+            model.body_inertia[bid] *= mass / self._nom_body_mass[bid]
+
+        slide_s = float(rng.uniform(*dr.slide_friction_scale))
+        pad_roll_s = float(rng.uniform(*dr.pad_roll_friction_scale))
+        desk_roll_s = float(rng.uniform(*dr.desk_roll_friction_scale))
+        for pair_ids, roll_s in ((ids.pad_pair_ids, pad_roll_s), (ids.desk_pair_ids, desk_roll_s)):
+            model.pair_friction[pair_ids, 0:2] *= slide_s
+            model.pair_friction[pair_ids, 3:5] *= roll_s
+        model.geom_friction[self._pad_geoms, 0] *= slide_s
+        model.geom_friction[self._pad_geoms, 2] *= pad_roll_s
+        model.geom_friction[self._desk_geoms, 0] *= slide_s
+        model.geom_friction[self._desk_geoms, 2] *= desk_roll_s
+
+    def _randomize_positions(self) -> None:
+        """Jitter the ball spawn, shift the whole pin rack, and jitter each pin."""
+        qpos, dr, ids, rng = self.data.qpos, self.cfg.dr, self.ids, self.np_random
+        ball = ids.ball_joint_qpos_addr
+        qpos[ball] += rng.uniform(-dr.ball_spawn_dx, dr.ball_spawn_dx)
+        qpos[ball + 1] += rng.uniform(-dr.ball_spawn_dy, dr.ball_spawn_dy)
+        shift = (
+            rng.uniform(-dr.rack_shift_x, dr.rack_shift_x),
+            rng.uniform(-dr.rack_shift_y, dr.rack_shift_y),
+        )
+        addrs = ids.pin_joint_qpos_addrs
+        base_xy = np.array([qpos[a : a + 2] for a in addrs])
+        min_sep = (
+            2.0 * self.cfg.pin.belly_radius
+            + 2.0 * 0.068 * np.sin(np.radians(dr.pin_init_tilt_deg))
+            + 0.003
+        )
+        jitters = np.zeros_like(base_xy)
+        for _ in range(64):
+            cand = rng.uniform(-dr.pin_pos_jitter, dr.pin_pos_jitter, size=base_xy.shape)
+            pos = base_xy + cand
+            diffs = pos[:, None, :] - pos[None, :, :]
+            dists = np.hypot(diffs[:, :, 0], diffs[:, :, 1]) + np.eye(len(addrs))
+            if np.all(dists >= min_sep):
+                jitters = cand
+                break
+        for addr, jit in zip(addrs, jitters):
+            qpos[addr : addr + 2] += shift + jit
+
+    def _tilt_pins(self) -> None:
+        """Give each settled pin a slight random lean, lifted so its foot clears the desk."""
+        data, ids, rng = self.data, self.ids, self.np_random
+        for addr, dof in zip(ids.pin_joint_qpos_addrs, ids.pin_joint_qvel_addrs):
+            tilt = float(np.radians(rng.uniform(0.0, self.cfg.dr.pin_init_tilt_deg)))
+            az = float(rng.uniform(0.0, 2.0 * np.pi))
+            s = np.sin(0.5 * tilt)
+            data.qpos[addr + 3 : addr + 7] = [np.cos(0.5 * tilt), -np.sin(az) * s, np.cos(az) * s, 0.0]
+            data.qpos[addr + 2] += self.cfg.pin.foot_radius * np.sin(tilt)
+            data.qvel[dof : dof + 6] = 0.0
 
     def _hold(self, target: np.ndarray) -> None:
         self.data.ctrl[self.ids.active_actuator_ids] = target
@@ -186,6 +281,7 @@ class SO101BowlingEnv(gym.Env):
                 credited_pins=outcome.credited_pins,
                 legal_strike=outcome.legal_strike,
                 legal_delivery=outcome.legal_delivery,
+                touched_ball=outcome.touched_ball,
             )
 
         mujoco.mj_forward(self.model, self.data)

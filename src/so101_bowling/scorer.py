@@ -13,11 +13,19 @@ class DeliveryPhase(IntEnum):
     INVALID = 3
 
 
+SOFT_FAULT_REASONS: frozenset[str] = frozenset({
+    "non_pusher_ball_contact",
+    "insufficient_push_displacement_slap",
+    "ball_moved_before_pusher_contact",
+})
+
+
 @dataclass
 class ScorerConfig:
     gamma: float = 0.99
     sim_dt: float = 0.002
     ball_radius: float = 0.0485
+    pin_belly_radius: float = 0.03435
     staging_clearance_m: float = 0.055
     foul_line_x: float = 0.44
     release_line_x: float = 0.44
@@ -29,20 +37,27 @@ class ScorerConfig:
     sep_dist_m: float = 0.015
     sep_duration_s: float = 0.025
     wobble_tilt_deg: float = 12.0
-    full_fall_tilt_deg: float = 45.0
+    full_fall_tilt_deg: float = 46.0
     min_wobble_substeps: int = 10
     off_table_z_m: float = -0.05
     quiet_vel_mps: float = 0.02
     quiet_dwell_s: float = 0.25
     max_coast_s: float = 2.5
-    w_stage_phi: float = 0.40
-    w_push_phi: float = 0.60
-    w_contact_speed: float = 0.60
-    w_launch_angle: float = 0.60
+    w_stage_phi: float = 1.0
+    w_push_phi: float = 1.5
+    r_first_contact: float = 1.0
+    w_contact_speed: float = 1.0
+    w_launch_angle: float = 1.0
+    w_ball_approach: float = 1.5
+    ball_approach_sigma_m: float = 0.08
+    w_partial_tilt: float = 1.0
+    w_step_penalty: float = 0.01
     w_action_jerk: float = 0.005
     r_pin_credit: float = 5.0
     r_strike_bonus: float = 5.0
     r_illegal_penalty: float = -2.0
+    r_soft_fault_penalty: float = -0.5
+    r_timeout_penalty: float = -0.5
 
 
 @dataclass
@@ -81,6 +96,10 @@ class EpisodeOutcome:
     pin_reward: float
     penalty_reward: float
     total_terminal_reward: float
+    approach_reward: float = 0.0
+    partial_pin_reward: float = 0.0
+    min_ball_head_pin_dist: float = float("inf")
+    touched_ball: bool = False
 
 
 class DeliveryScorer:
@@ -91,6 +110,7 @@ class DeliveryScorer:
         self, ball_init_pos, pin_init_positions, pin_init_up_vectors, paddle_init_pos=None
     ) -> None:
         self.ball_init_pos = np.array(ball_init_pos, dtype=float, copy=True)
+        self.head_pin_xy = np.array(pin_init_positions[0][:2], dtype=float, copy=True)
         aim = np.mean(pin_init_positions, axis=0)[:2] - self.ball_init_pos[:2]
         norm = np.linalg.norm(aim)
         self.u_aim = aim / norm if norm else np.array([1.0, 0.0])
@@ -114,13 +134,16 @@ class DeliveryScorer:
         self._left_reach = False
         self._latest_t: float | None = None
         self._latest_ball_x = float(self.ball_init_pos[0])
+        self._contact_bonus_awarded = False
+        self._contact_bonus_pending = False
+        self._min_ball_head_pin_dist = float("inf")
         self._phi_prev = 0.0
         self._terminated = False
         if paddle_init_pos is not None:
             self._phi_prev = self.compute_potential(paddle_init_pos)
 
     def compute_potential(self, paddle_pos) -> float:
-        if self._terminated or self.phase == DeliveryPhase.INVALID:
+        if self.phase == DeliveryPhase.INVALID:
             return 0.0
         cfg = self.config
         if self.phase == DeliveryPhase.PUSHING:
@@ -133,7 +156,7 @@ class DeliveryScorer:
         clearance = np.linalg.norm(paddle - self.ball_init_pos)
         gate = np.clip((clearance - cfg.ball_radius) / cfg.staging_clearance_m, 0.0, 1.0)
         gate = gate**2 * (3.0 - 2.0 * gate)
-        alignment = np.exp(-0.5 * (distance_to_stage / cfg.staging_clearance_m) ** 2)
+        alignment = 1.0 - np.tanh(distance_to_stage / 0.12)
         return float(cfg.w_stage_phi * gate * alignment)
 
     def _invalidate(self, reason: str) -> None:
@@ -198,6 +221,9 @@ class DeliveryScorer:
             elif snap.pusher_ball_contact:
                 self.phase = DeliveryPhase.PUSHING
                 self.contact_start_ball_xy = ball_xy.copy()
+                if not self._contact_bonus_awarded:
+                    self._contact_bonus_awarded = True
+                    self._contact_bonus_pending = True
             else:
                 return
 
@@ -207,6 +233,8 @@ class DeliveryScorer:
             self._invalidate("double_tap_restrike")
 
         if self.phase == DeliveryPhase.RELEASED:
+            d_head = float(np.linalg.norm(ball_xy - self.head_pin_xy))
+            self._min_ball_head_pin_dist = min(self._min_ball_head_pin_dist, d_head)
             self._left_reach |= ball_x - cfg.ball_radius > cfg.foul_line_x
             ball_done = float(snap.ball_pos[2]) < cfg.off_table_z_m or float(np.linalg.norm(snap.ball_vel[:2])) < cfg.quiet_vel_mps
             pins_done = bool(np.all((snap.pin_positions[:, 2] < cfg.off_table_z_m) | (snap.pin_speeds < cfg.quiet_vel_mps)))
@@ -218,7 +246,7 @@ class DeliveryScorer:
             self._sep_steps = 0
             if self.pin_impacted.any():
                 self._invalidate("pre_release_pin_impact")
-            elif ball_x > cfg.rack_x_nom - 0.05:
+            elif ball_x > self.head_pin_xy[0] - 0.05:
                 self._invalidate("late_release_past_rack")
             else:
                 disp = float(np.dot(ball_xy - self.contact_start_ball_xy, self.u_aim))
@@ -234,7 +262,7 @@ class DeliveryScorer:
         if self.pin_impacted.any():
             self._invalidate("pre_release_pin_impact")
         elif self._sep_steps * cfg.sim_dt >= cfg.sep_duration_s:
-            if self._separation_x > cfg.rack_x_nom - 0.05:
+            if self._separation_x > self.head_pin_xy[0] - 0.05:
                 self._invalidate("late_release_past_rack")
             elif self.max_contact_fwd_disp < cfg.min_push_disp_m:
                 self._invalidate("insufficient_push_displacement_slap")
@@ -242,12 +270,20 @@ class DeliveryScorer:
                 self.phase = DeliveryPhase.RELEASED
 
     def step_control_reward(self, paddle_pos, action, prev_action, terminated: bool) -> float:
-        self._terminated |= terminated
         phi_next = self.compute_potential(paddle_pos)
         delta = np.asarray(action) - np.asarray(prev_action)
         reward = self.config.gamma * phi_next - self._phi_prev
+        if self._contact_bonus_pending:
+            if self.phase != DeliveryPhase.INVALID:
+                reward += self.config.r_first_contact
+            self._contact_bonus_pending = False
         self._phi_prev = phi_next
-        return float(reward - self.config.w_action_jerk * np.sum(delta**2))
+        self._terminated |= terminated
+        return float(
+            reward
+            - self.config.w_step_penalty
+            - self.config.w_action_jerk * np.sum(delta**2)
+        )
 
     def should_end_delivery(self, elapsed_delivery_s: float, delivery_timeout_s: float) -> tuple[bool, str | None]:
         if self.phase == DeliveryPhase.INVALID:
@@ -275,9 +311,11 @@ class DeliveryScorer:
         cfg = self.config
         legal = self.phase == DeliveryPhase.RELEASED
         credited = full = off_table = wobble = 0
-        speed = angle = launch_reward = pin_reward = penalty = 0.0
+        speed = angle = launch_reward = approach_reward = pin_reward = partial_pin_reward = penalty = 0.0
         reason = self.invalid_reason
         if legal:
+            d_head = float(np.linalg.norm(np.asarray(final_snap.ball_pos[:2]) - self.head_pin_xy))
+            self._min_ball_head_pin_dist = min(self._min_ball_head_pin_dist, d_head)
             speed = float(np.linalg.norm(self.v_out))
             if speed:
                 forward = np.dot(self.u_aim, self.v_out)
@@ -286,18 +324,26 @@ class DeliveryScorer:
             if speed >= cfg.min_launch_speed_mps:
                 launch_reward = cfg.w_contact_speed * min(speed / cfg.target_launch_speed_mps, 1.0)
                 launch_reward += cfg.w_launch_angle * float(np.exp(-0.5 * (angle / cfg.aim_sigma_rad) ** 2))
+            if np.isfinite(self._min_ball_head_pin_dist):
+                d_miss = max(0.0, self._min_ball_head_pin_dist - (cfg.ball_radius + cfg.pin_belly_radius))
+                approach_reward = cfg.w_ball_approach * float(np.exp(-0.5 * (d_miss / cfg.ball_approach_sigma_m) ** 2))
             off_mask = self.pin_impacted & (final_snap.pin_positions[:, 2] < cfg.off_table_z_m)
             tilt = self._tilts_deg(final_snap.pin_up_vectors)
-            full_mask = off_mask | (self.pin_impacted & (tilt + 1e-9 >= cfg.full_fall_tilt_deg))
+            full_mask = off_mask | (self.pin_impacted & (tilt > cfg.full_fall_tilt_deg))
             off_table = int(np.count_nonzero(off_mask))
             full = int(np.count_nonzero(full_mask))
             wobble = int(np.count_nonzero(self.pin_wobbled & ~full_mask))
-            credited = full + wobble
-            pin_reward = cfg.r_pin_credit * credited + (cfg.r_strike_bonus if credited == 3 else 0.0)
+            credited = full
+            bins = np.floor(np.clip(self.pin_peak_tilt_deg, 0.0, 45.0) / 5.0)
+            partial_pin_reward = float(
+                np.sum(np.where(self.pin_impacted & ~full_mask, cfg.w_partial_tilt * (bins / 9.0), 0.0))
+            )
+            pin_reward = cfg.r_pin_credit * credited + (cfg.r_strike_bonus if credited == 3 else 0.0) + partial_pin_reward
         elif self.phase == DeliveryPhase.INVALID:
-            penalty = cfg.r_illegal_penalty
+            penalty = cfg.r_soft_fault_penalty if reason in SOFT_FAULT_REASONS else cfg.r_illegal_penalty
         else:
             reason = "no_legal_release"
+            penalty = cfg.r_timeout_penalty
 
         return EpisodeOutcome(
             legal_delivery=legal,
@@ -314,7 +360,11 @@ class DeliveryScorer:
             launch_reward=launch_reward,
             pin_reward=pin_reward,
             penalty_reward=penalty,
-            total_terminal_reward=launch_reward + pin_reward + penalty,
+            total_terminal_reward=launch_reward + approach_reward + pin_reward + penalty,
+            approach_reward=approach_reward,
+            partial_pin_reward=partial_pin_reward,
+            min_ball_head_pin_dist=float(self._min_ball_head_pin_dist),
+            touched_ball=self._contact_bonus_awarded,
         )
 
     def critic_state(self, remaining_time_frac: float) -> np.ndarray:

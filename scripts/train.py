@@ -124,10 +124,50 @@ class PPOConfig:
     seed: int = 0
     out: str = "checkpoints/ppo.pt"
     device: str = "auto"
+    save_every: int = 20_000
+    resume: str = ""
 
 
 def parse_args(argv: list[str] | None = None) -> PPOConfig:
     return parse_policy_cli(PPOConfig, argv, description="Train PPO on SO101BowlingEnv.")
+
+
+def _ckpt_siblings(out_path: Path) -> tuple[Path, Path]:
+    suffix = out_path.suffix or ".pt"
+    latest_path = out_path.parent / f"{out_path.stem}_latest{suffix}"
+    best_path = out_path.parent / f"{out_path.stem}_best{suffix}"
+    return latest_path, best_path
+
+
+def _save_checkpoint(
+    path: Path,
+    model: ActorCritic,
+    opt: torch.optim.Optimizer,
+    obs_norm: RunningObsNorm,
+    obs_dim: int,
+    act_dim: int,
+    cfg: PPOConfig,
+    global_step: int,
+    best_ret: float,
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(
+        {
+            "actor_state_dict": {k: v.detach().cpu() for k, v in model.actor.state_dict().items()},
+            "critic_state_dict": {k: v.detach().cpu() for k, v in model.critic.state_dict().items()},
+            "optimizer_state_dict": opt.state_dict(),
+            "obs_dim": obs_dim,
+            "act_dim": act_dim,
+            "obs_mean": torch.from_numpy(obs_norm.mean.astype(np.float32)),
+            "obs_std": torch.from_numpy(obs_norm.std.astype(np.float32)),
+            "obs_var": torch.from_numpy(obs_norm.var.astype(np.float32)),
+            "obs_count": float(obs_norm.count),
+            "global_step": int(global_step),
+            "best_return": float(best_ret),
+            "args": asdict(cfg),
+        },
+        path,
+    )
 
 
 def train(cfg: PPOConfig) -> Path:
@@ -144,9 +184,35 @@ def train(cfg: PPOConfig) -> Path:
     model = ActorCritic(obs_dim, act_dim, hidden=cfg.hidden).to(device)
     opt = torch.optim.Adam(model.parameters(), lr=cfg.lr, eps=1e-5)
 
+    out_path = Path(cfg.out)
+    suffix = out_path.suffix or ".pt"
+    latest_path, best_path = _ckpt_siblings(out_path)
+
+    global_step = 0
+    best_ret = -float("inf")
+    if cfg.resume:
+        ckpt = torch.load(Path(cfg.resume), map_location=device, weights_only=True)
+        model.actor.load_state_dict(ckpt["actor_state_dict"], strict=True)
+        if "critic_state_dict" in ckpt:
+            model.critic.load_state_dict(ckpt["critic_state_dict"], strict=True)
+        if "optimizer_state_dict" in ckpt:
+            opt.load_state_dict(ckpt["optimizer_state_dict"])
+        obs_norm.mean = ckpt["obs_mean"].cpu().numpy().astype(np.float64)
+        if "obs_var" in ckpt:
+            obs_norm.var = ckpt["obs_var"].cpu().numpy().astype(np.float64)
+        else:
+            obs_norm.var = ckpt["obs_std"].cpu().numpy().astype(np.float64) ** 2
+        obs_norm.count = float(ckpt.get("obs_count", 1.0))
+        global_step = int(ckpt.get("global_step", 0))
+        best_ret = float(ckpt.get("best_return", -float("inf")))
+
     rollout_n = cfg.rollout_steps
     batch_size = min(cfg.batch_size, rollout_n)
-    num_updates = max(1, (cfg.total_steps + rollout_n - 1) // rollout_n)
+    remaining_steps = max(0, cfg.total_steps - global_step)
+    num_updates = (remaining_steps + rollout_n - 1) // rollout_n
+    total_updates = max(1, (cfg.total_steps + rollout_n - 1) // rollout_n)
+    start_update = global_step // rollout_n
+    next_save_step = ((global_step // cfg.save_every) + 1) * cfg.save_every if cfg.save_every > 0 else 0
 
     obs_buf = torch.empty((rollout_n, obs_dim), dtype=torch.float32)
     act_buf = torch.empty((rollout_n, act_dim), dtype=torch.float32)
@@ -159,13 +225,12 @@ def train(cfg: PPOConfig) -> Path:
     obs_norm.update(raw_obs)
     ep_ret = 0.0
     ep_count = 0
-    recent: deque[tuple[float, bool, int, bool]] = deque(maxlen=50)
-    global_step = 0
+    recent: deque[tuple[float, bool, int, bool, bool]] = deque(maxlen=50)
     t0 = perf_counter()
 
     for update in range(1, num_updates + 1):
         if cfg.anneal_lr:
-            frac = 1.0 - (update - 1.0) / num_updates
+            frac = max(0.0, 1.0 - (start_update + update - 1.0) / total_updates)
             opt.param_groups[0]["lr"] = frac * cfg.lr
 
         model.eval()
@@ -195,6 +260,7 @@ def train(cfg: PPOConfig) -> Path:
                     bool(info.get("legal_delivery", False)),
                     int(info.get("credited_pins", 0)),
                     bool(info.get("legal_strike", False)),
+                    bool(info.get("touched_ball", False)),
                 ))
                 ep_ret = 0.0
                 raw_obs, _ = env.reset()
@@ -240,35 +306,37 @@ def train(cfg: PPOConfig) -> Path:
                 nn.utils.clip_grad_norm_(model.parameters(), cfg.max_grad_norm)
                 opt.step()
 
+        if recent:
+            m_ret = float(np.mean([r[0] for r in recent]))
+            m_leg = float(np.mean([r[1] for r in recent]))
+            m_pin = float(np.mean([r[2] for r in recent]))
+            m_str = float(np.mean([r[3] for r in recent]))
+            m_touch = float(np.mean([r[4] for r in recent]))
+        else:
+            m_ret = m_leg = m_pin = m_str = m_touch = 0.0
+
+        if len(recent) >= 10 and m_ret > best_ret:
+            best_ret = m_ret
+            _save_checkpoint(best_path, model, opt, obs_norm, obs_dim, act_dim, cfg, global_step, best_ret)
+
+        if cfg.save_every > 0 and global_step >= next_save_step:
+            step_path = out_path.parent / f"{out_path.stem}_step_{global_step}{suffix}"
+            _save_checkpoint(step_path, model, opt, obs_norm, obs_dim, act_dim, cfg, global_step, best_ret)
+            _save_checkpoint(latest_path, model, opt, obs_norm, obs_dim, act_dim, cfg, global_step, best_ret)
+            while global_step >= next_save_step:
+                next_save_step += cfg.save_every
+
         if update == 1 or update % max(1, num_updates // 20) == 0 or update == num_updates:
-            if recent:
-                m_ret = float(np.mean([r[0] for r in recent]))
-                m_leg = float(np.mean([r[1] for r in recent]))
-                m_pin = float(np.mean([r[2] for r in recent]))
-                m_str = float(np.mean([r[3] for r in recent]))
-            else:
-                m_ret = m_leg = m_pin = m_str = 0.0
             sps = global_step / max(1e-6, perf_counter() - t0)
             print(
                 f"step={global_step:7d}/{cfg.total_steps} eps={ep_count:4d} "
-                f"ret={m_ret:6.2f} legal={m_leg:.2f} pins={m_pin:.2f} "
+                f"ret={m_ret:6.2f} touch={m_touch:.2f} legal={m_leg:.2f} pins={m_pin:.2f} "
                 f"strike={m_str:.2f} sps={sps:.0f}",
                 flush=True,
             )
 
-    out_path = Path(cfg.out)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(
-        {
-            "actor_state_dict": {k: v.detach().cpu() for k, v in model.actor.state_dict().items()},
-            "obs_dim": obs_dim,
-            "act_dim": act_dim,
-            "obs_mean": torch.from_numpy(obs_norm.mean.astype(np.float32)),
-            "obs_std": torch.from_numpy(obs_norm.std.astype(np.float32)),
-            "args": asdict(cfg),
-        },
-        out_path,
-    )
+    _save_checkpoint(out_path, model, opt, obs_norm, obs_dim, act_dim, cfg, global_step, best_ret)
+    _save_checkpoint(latest_path, model, opt, obs_norm, obs_dim, act_dim, cfg, global_step, best_ret)
     print(f"Saved checkpoint to {out_path}", flush=True)
     return out_path
 

@@ -1,4 +1,4 @@
-"""Evaluate a saved PPO checkpoint (or random policy) on SO101BowlingEnv."""
+"""Eval"""
 
 from __future__ import annotations
 
@@ -26,6 +26,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--gui", action="store_true", help="Launch passive MuJoCo viewer (use mjpython on macOS).")
     p.add_argument("--stochastic", action="store_true", help="Sample from policy instead of using mean action.")
+    p.add_argument(
+        "--reset-delay",
+        type=float,
+        default=0.0,
+        help="Seconds to pause between episodes before resetting (e.g. for GUI inspection or real-world pin setup).",
+    )
     return p.parse_args(argv)
 
 
@@ -102,6 +108,14 @@ def evaluate(args: argparse.Namespace) -> dict[str, object]:
                 f"legal={int(legal)} pins={credited} strike={int(strike)} reason={reason}",
                 flush=True,
             )
+            if args.reset_delay > 0.0 and ep < args.episodes - 1:
+                delay_end = time.perf_counter() + args.reset_delay
+                while time.perf_counter() < delay_end:
+                    if viewer is not None:
+                        if not viewer.is_running():
+                            return {}
+                        viewer.sync()
+                    time.sleep(min(0.05, max(0.0, delay_end - time.perf_counter())))
     finally:
         if viewer is not None:
             viewer.close()

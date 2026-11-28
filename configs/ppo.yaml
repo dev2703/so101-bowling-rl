@@ -1,6 +1,4 @@
-# PPO hyperparameters for SO101BowlingEnv
-# Override any key on the CLI, e.g.:
-#   uv run python scripts/train.py --config configs/ppo.yaml --lr 1e-4 --seed 42
+# PPO hyperparameters
 
 total_steps: 100000
 rollout_steps: 1024
@@ -18,3 +16,4 @@ hidden: 128
 seed: 0
 out: checkpoints/ppo.pt
 device: auto
+save_every: 20000
