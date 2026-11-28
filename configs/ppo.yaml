@@ -17,3 +17,7 @@ seed: 0
 out: checkpoints/ppo.pt
 device: auto
 save_every: 20000
+num_envs: 4
+eval_every: 10000
+eval_episodes: 10
+dr: true

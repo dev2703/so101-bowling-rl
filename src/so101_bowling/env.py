@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, replace
+import math
 
 import gymnasium as gym
 import mujoco
@@ -28,6 +29,10 @@ from so101_bowling.scorer import (
 )
 
 OBS_DIM = 53
+
+# Shared by every substep without a pin-pin contact; read-only so it cannot be mutated.
+_EMPTY_PIN_PIN = np.zeros((3, 3), dtype=bool)
+_EMPTY_PIN_PIN.setflags(write=False)
 
 
 class SO101BowlingEnv(gym.Env):
@@ -63,16 +68,13 @@ class SO101BowlingEnv(gym.Env):
 
         self._arm_geoms = np.array(sorted(ids.arm_geom_ids), dtype=np.intp)
         self._arm_aabb = self.model.geom_aabb[self._arm_geoms].reshape(-1, 2, 3)
-        self._is_arm_geom = np.zeros(self.model.ngeom, dtype=bool)
-        self._is_arm_geom[list(ids.arm_geom_ids)] = True
-        self._is_pusher_geom = np.zeros(self.model.ngeom, dtype=bool)
-        self._is_pusher_geom[list(ids.pusher_geom_ids)] = True
-        self._is_table_geom = np.zeros(self.model.ngeom, dtype=bool)
-        self._is_table_geom[list(ids.table_geom_ids)] = True
-        self._pin_geom_idx = np.full(self.model.ngeom, -1, dtype=np.intp)
-        for pin, geoms in enumerate(ids.pin_geom_ids):
-            self._pin_geom_idx[list(geoms)] = pin
-        self._pin_vel = np.asarray(ids.pin_joint_qvel_addrs)[:, None] + np.arange(3)
+        self._arm_aabb_c = self._arm_aabb[:, 0].copy()
+        self._arm_aabb_h = self._arm_aabb[:, 1].copy()
+        self._pusher_set = frozenset(ids.pusher_geom_ids)
+        self._arm_set = frozenset(ids.arm_geom_ids)
+        self._table_set = frozenset(ids.table_geom_ids)
+        self._pin_geom_map = {g: pin for pin, geoms in enumerate(ids.pin_geom_ids) for g in geoms}
+        self._pin_qvel_addrs = tuple(int(a) for a in ids.pin_joint_qvel_addrs)
         self._ft = np.zeros(6)
 
         geom_id = lambda n: mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_GEOM, n)
@@ -291,65 +293,70 @@ class SO101BowlingEnv(gym.Env):
 
     def _advance(self) -> SubstepSnapshot:
         mujoco.mj_step(self.model, self.data)
-        snap = self._snapshot()
+        snap = self._snapshot(need_surface_dist=(self.scorer.phase == DeliveryPhase.PUSHING))
         self.scorer.update_substep(snap)
         return snap
 
-    def _snapshot(self) -> SubstepSnapshot:
+    def _snapshot(self, need_surface_dist: bool = False) -> SubstepSnapshot:
         data, ids = self.data, self.ids
         paddle = data.site_xpos[ids.gripper_site_id]
         x_axes = data.geom_xmat[self._arm_geoms, :3]
         max_x = data.geom_xpos[self._arm_geoms, 0] + np.sum(
-            x_axes * self._arm_aabb[:, 0] + np.abs(x_axes) * self._arm_aabb[:, 1], axis=1
+            x_axes * self._arm_aabb_c + np.abs(x_axes) * self._arm_aabb_h, axis=1
         )
 
         pusher_ball = other_ball = arm_pin = table_slam = False
         ball_pin = [False, False, False]
-        pin_pin = np.zeros((3, 3), dtype=bool)
+        pin_pin = _EMPTY_PIN_PIN
+        ball = ids.ball_geom_id
+        pusher_set, arm_set, table_set = self._pusher_set, self._arm_set, self._table_set
+        pin_map = self._pin_geom_map
         ncon = int(data.ncon)
-        if ncon > 0:
-            geoms = data.contact.geom[:ncon]
-            g1, g2 = geoms[:, 0], geoms[:, 1]
-            is_g1_ball = g1 == ids.ball_geom_id
-            is_ball = is_g1_ball | (g2 == ids.ball_geom_id)
-            if is_ball.any():
-                other = np.where(is_g1_ball[is_ball], g2[is_ball], g1[is_ball])
-                is_push = self._is_pusher_geom[other]
-                pusher_ball = bool(is_push.any())
-                other_ball = bool((self._is_arm_geom[other] & ~is_push).any())
-                for p in self._pin_geom_idx[other]:
-                    if p >= 0:
-                        ball_pin[int(p)] = True
-            non_ball = ~is_ball
-            if non_ball.any():
-                nb_g1, nb_g2 = g1[non_ball], g2[non_ball]
-                a1 = self._is_arm_geom[nb_g1]
-                arm_mask = a1 | self._is_arm_geom[nb_g2]
-                if arm_mask.any():
-                    arm_other = np.where(a1[arm_mask], nb_g2[arm_mask], nb_g1[arm_mask])
-                    arm_pin = bool((self._pin_geom_idx[arm_other] >= 0).any())
-                    tbl_hits = self._is_table_geom[arm_other]
-                    if tbl_hits.any():
-                        for ci in np.flatnonzero(non_ball)[arm_mask][tbl_hits]:
-                            mujoco.mj_contactForce(self.model, data, int(ci), self._ft)
-                            if self._ft[0] > 8.0:
-                                table_slam = True
-                                break
-                p1, p2 = self._pin_geom_idx[nb_g1], self._pin_geom_idx[nb_g2]
-                pp = (p1 >= 0) & (p2 >= 0)
-                if pp.any():
-                    for i_p, j_p in zip(p1[pp], p2[pp]):
-                        pin_pin[int(i_p), int(j_p)] = pin_pin[int(j_p), int(i_p)] = True
+        for ci, (g1, g2) in enumerate(data.contact.geom[:ncon].tolist()):
+            if g1 == ball or g2 == ball:
+                other = g2 if g1 == ball else g1
+                if other in pusher_set:
+                    pusher_ball = True
+                elif other in arm_set:
+                    other_ball = True
+                if other in pin_map:
+                    ball_pin[pin_map[other]] = True
+                continue
+            if g1 in arm_set or g2 in arm_set:
+                arm_other = g2 if g1 in arm_set else g1
+                if arm_other in pin_map:
+                    arm_pin = True
+                if not table_slam and arm_other in table_set:
+                    mujoco.mj_contactForce(self.model, data, ci, self._ft)
+                    table_slam = bool(self._ft[0] > 8.0)
+            if g1 in pin_map and g2 in pin_map:
+                if pin_pin is _EMPTY_PIN_PIN:
+                    pin_pin = np.zeros((3, 3), dtype=bool)
+                i, j = pin_map[g1], pin_map[g2]
+                pin_pin[i, j] = pin_pin[j, i] = True
 
-        pin_v = data.qvel[self._pin_vel]
+        pin_speeds = []
+        for addr in self._pin_qvel_addrs:
+            vx, vy, vz = data.qvel[addr : addr + 3].tolist()
+            pin_speeds.append(math.sqrt(vx * vx + vy * vy + vz * vz))
+
+        # The surface gap is only read while pushing without contact, and is costly to compute.
+        if need_surface_dist and not pusher_ball:
+            surface_dist = min(
+                mujoco.mj_geomDistance(self.model, data, geom, ball, 0.5, None)
+                for geom in ids.pusher_geom_ids
+            )
+        else:
+            surface_dist = 0.0 if pusher_ball else float("inf")
+
         return SubstepSnapshot(
             t=data.time,
             paddle_pos=paddle.copy(),
             ball_pos=data.xpos[ids.ball_body_id].copy(),
             ball_vel=data.qvel[ids.ball_joint_qvel_addr : ids.ball_joint_qvel_addr + 3].copy(),
-            pin_positions=data.xpos[ids.pin_body_ids].copy(),
-            pin_up_vectors=data.xmat[ids.pin_body_ids, 2::3].copy(),
-            pin_speeds=np.sqrt(np.sum(pin_v * pin_v, axis=1)),
+            pin_positions=data.xpos[ids.pin_body_ids],
+            pin_up_vectors=data.xmat[ids.pin_body_ids, 2::3],
+            pin_speeds=np.array(pin_speeds),
             max_arm_x=max(float(max_x.max()), float(paddle[0])),
             pusher_ball_contact=pusher_ball,
             other_arm_ball_contact=other_ball,
@@ -357,10 +364,7 @@ class SO101BowlingEnv(gym.Env):
             table_slam=table_slam,
             ball_pin_contacts=tuple(ball_pin),
             pin_pin_contacts=pin_pin,
-            paddle_ball_surface_dist=min(
-                mujoco.mj_geomDistance(self.model, data, geom, ids.ball_geom_id, 0.5, None)
-                for geom in ids.pusher_geom_ids
-            ),
+            paddle_ball_surface_dist=surface_dist,
         )
 
     def _observation(self) -> np.ndarray:

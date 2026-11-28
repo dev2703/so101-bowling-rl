@@ -8,7 +8,6 @@ from pathlib import Path
 import sys
 import time
 
-import mujoco.viewer
 import numpy as np
 import torch
 
@@ -25,6 +24,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--episodes", type=int, default=10)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--gui", action="store_true", help="Launch passive MuJoCo viewer (use mjpython on macOS).")
+    p.add_argument(
+        "--dr",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Force domain randomization on or off (default: workspace config).",
+    )
     p.add_argument("--stochastic", action="store_true", help="Sample from policy instead of using mean action.")
     p.add_argument(
         "--reset-delay",
@@ -53,8 +58,12 @@ def evaluate(args: argparse.Namespace) -> dict[str, object]:
         actor, obs_mean, obs_std = _load_policy(args.checkpoint)
 
     rng = np.random.default_rng(args.seed)
-    env = SO101BowlingEnv(seed=args.seed)
-    viewer = mujoco.viewer.launch_passive(env.model, env.data) if args.gui else None
+    env = SO101BowlingEnv(seed=args.seed, dr=args.dr)
+    viewer = None
+    if args.gui:
+        import mujoco.viewer
+
+        viewer = mujoco.viewer.launch_passive(env.model, env.data)
 
     returns: list[float] = []
     legals: list[bool] = []

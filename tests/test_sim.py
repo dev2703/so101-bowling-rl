@@ -9,6 +9,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 import torch
+from gymnasium.utils.env_checker import check_env
 
 from so101_bowling import DeliveryPhase, DeliveryScorer, SO101BowlingEnv, ScorerConfig
 from so101_bowling.scorer import SubstepSnapshot
@@ -501,3 +502,141 @@ def test_scorer_late_release_tracks_shifted_head_pin() -> None:
     )
     assert s_fwd.phase == DeliveryPhase.INVALID
     assert s_fwd.invalid_reason == "late_release_past_rack"
+
+
+def test_env_passes_gymnasium_checker() -> None:
+    check_env(SO101BowlingEnv(seed=0), skip_render_check=True)
+
+
+REWARD_PARTS = (
+    "shaping_reward",
+    "contact_reward",
+    "cost_reward",
+    "launch_reward",
+    "approach_reward",
+    "pin_reward",
+    "penalty_reward",
+)
+
+
+def test_reward_components_sum_to_episode_return() -> None:
+    env = SO101BowlingEnv(dr=False)
+    # Same env twice (timeout, then touch-and-fault) so per-episode totals must also reset.
+    outcomes = []
+    for action in ((0.0, 0.0, 0.0, 0.0), (0.1, 0.2, 0.7, -0.7)):
+        env.reset(seed=0)
+        ep_ret, terminated = 0.0, False
+        while not terminated:
+            _, reward, terminated, _, info = env.step(np.array(action, dtype=np.float32))
+            ep_ret += reward
+        out = info["outcome"]
+        assert sum(out[k] for k in REWARD_PARTS) == pytest.approx(ep_ret), info["end_reason"]
+        outcomes.append((info["end_reason"], out))
+    (timeout_reason, timeout), (_, fault) = outcomes
+    assert timeout_reason == "delivery_timeout"
+    assert timeout["contact_reward"] == 0.0 and timeout["cost_reward"] < 0.0
+    assert fault["contact_reward"] > 0.0 and fault["penalty_reward"] < 0.0
+
+    scorer = DeliveryScorer(ScorerConfig())
+    _advance_to_released(scorer)
+    ep_ret = scorer.step_control_reward((0.3, 0.0, 0.06), np.full(4, 0.5), np.zeros(4), terminated=False)
+    ep_ret += scorer.step_control_reward((0.35, 0.0, 0.06), np.zeros(4), np.full(4, 0.5), terminated=True)
+    legal = scorer.finalize_episode(
+        _make_snap(0.10, ball_pos=(0.62, 0.0, 0.052), ball_pin_contacts=(True, True, False), pin_tilts_deg=(60.0, 20.0, 0.0)),
+        unresolved_motion=False,
+    )
+    ep_ret += legal.total_terminal_reward
+    assert legal.legal_delivery is True
+    assert all(getattr(legal, k) != 0.0 for k in REWARD_PARTS if k != "penalty_reward")
+    assert sum(getattr(legal, k) for k in REWARD_PARTS) == pytest.approx(ep_ret)
+
+
+def test_vectorized_train_saves_deterministic_best(tmp_path: Path) -> None:
+    ckpt = tmp_path / "ppo_vec.pt"
+    train_cmd = [
+        sys.executable,
+        str(REPO_ROOT / "scripts" / "train.py"),
+        "--num-envs",
+        "2",
+        "--eval-every",
+        "64",
+        "--eval-episodes",
+        "2",
+        "--total-steps",
+        "128",
+        "--rollout-steps",
+        "64",
+        "--epochs",
+        "1",
+        "--batch-size",
+        "32",
+        "--out",
+        str(ckpt),
+    ]
+    res_train = subprocess.run(train_cmd, capture_output=True, text=True, check=True)
+    best = tmp_path / "ppo_vec_best.pt"
+    assert best.exists(), res_train.stderr
+    assert "R[" in res_train.stdout
+    assert "EVAL" in res_train.stdout
+    best_payload = torch.load(best, map_location="cpu", weights_only=True)
+    assert best_payload["best_return_kind"] == "eval"
+
+    # Resuming a legacy checkpoint (no best_return_kind) must reset best_ret so deterministic eval replaces _best.pt.
+    legacy = tmp_path / "legacy.pt"
+    legacy_payload = dict(best_payload)
+    legacy_payload.pop("best_return_kind")
+    legacy_payload["best_return"] = 1e6
+    legacy_payload["global_step"] = 64
+    torch.save(legacy_payload, legacy)
+    resumed_out = tmp_path / "legacy_resumed.pt"
+    subprocess.run(
+        [
+            sys.executable,
+            str(REPO_ROOT / "scripts" / "train.py"),
+            "--resume",
+            str(legacy),
+            "--num-envs",
+            "2",
+            "--eval-every",
+            "64",
+            "--eval-episodes",
+            "2",
+            "--total-steps",
+            "128",
+            "--rollout-steps",
+            "64",
+            "--epochs",
+            "1",
+            "--batch-size",
+            "32",
+            "--out",
+            str(resumed_out),
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    resumed_best = tmp_path / "legacy_resumed_best.pt"
+    assert resumed_best.exists()
+    resumed_best_payload = torch.load(resumed_best, map_location="cpu", weights_only=True)
+    assert resumed_best_payload["best_return_kind"] == "eval"
+    assert resumed_best_payload["best_return"] < 1e5
+
+    eval_cmd = [
+        sys.executable,
+        str(REPO_ROOT / "scripts" / "eval.py"),
+        "--checkpoint",
+        str(best),
+        "--episodes",
+        "2",
+        "--no-dr",
+    ]
+    res_eval = subprocess.run(eval_cmd, capture_output=True, text=True, check=True)
+    assert "SUMMARY" in res_eval.stdout
+
+
+def test_eval_import_is_headless() -> None:
+    code = "import sys; sys.path.insert(0, sys.argv[1]); import eval; assert 'mujoco.viewer' not in sys.modules"
+    subprocess.run(
+        [sys.executable, "-c", code, str(REPO_ROOT / "scripts")], capture_output=True, text=True, check=True
+    )

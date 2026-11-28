@@ -2,6 +2,7 @@
 
 from dataclasses import dataclass
 from enum import IntEnum
+import math
 
 import numpy as np
 
@@ -100,11 +101,16 @@ class EpisodeOutcome:
     partial_pin_reward: float = 0.0
     min_ball_head_pin_dist: float = float("inf")
     touched_ball: bool = False
+    shaping_reward: float = 0.0
+    contact_reward: float = 0.0
+    cost_reward: float = 0.0
 
 
 class DeliveryScorer:
     def __init__(self, config: ScorerConfig | None = None) -> None:
         self.config = config if config is not None else ScorerConfig()
+        self.phase = DeliveryPhase.APPROACH
+        self._ep_shaping_reward = self._ep_contact_reward = self._ep_cost_reward = 0.0
 
     def reset(
         self, ball_init_pos, pin_init_positions, pin_init_up_vectors, paddle_init_pos=None
@@ -138,6 +144,7 @@ class DeliveryScorer:
         self._contact_bonus_pending = False
         self._min_ball_head_pin_dist = float("inf")
         self._phi_prev = 0.0
+        self._ep_shaping_reward = self._ep_contact_reward = self._ep_cost_reward = 0.0
         self._terminated = False
         if paddle_init_pos is not None:
             self._phi_prev = self.compute_potential(paddle_init_pos)
@@ -172,7 +179,10 @@ class DeliveryScorer:
         return np.degrees(np.arccos(np.clip(cosines, -1.0, 1.0)))
 
     def _track_impacts(self, snap: SubstepSnapshot) -> None:
-        self.pin_impacted |= np.asarray(snap.ball_pin_contacts, dtype=bool)
+        if any(snap.ball_pin_contacts):
+            self.pin_impacted |= np.asarray(snap.ball_pin_contacts, dtype=bool)
+        if not self.pin_impacted.any():
+            return
         c = np.asarray(snap.pin_pin_contacts, dtype=bool)
         if c.shape == (3, 3):
             p0, p1, p2 = bool(self.pin_impacted[0]), bool(self.pin_impacted[1]), bool(self.pin_impacted[2])
@@ -200,7 +210,7 @@ class DeliveryScorer:
         cfg = self.config
         self._latest_t = snap.t
         ball_xy = np.asarray(snap.ball_pos[:2])
-        ball_x = float(ball_xy[0])
+        ball_x, ball_y = float(ball_xy[0]), float(ball_xy[1])
         self._latest_ball_x = ball_x
         for illegal, reason in (
             (snap.arm_pin_contact, "arm_pin_contact"),
@@ -216,7 +226,9 @@ class DeliveryScorer:
 
         self._track_impacts(snap)
         if self.phase == DeliveryPhase.APPROACH:
-            if np.linalg.norm(ball_xy - self.ball_init_pos[:2]) > 0.015:
+            dx = ball_x - float(self.ball_init_pos[0])
+            dy = ball_y - float(self.ball_init_pos[1])
+            if dx * dx + dy * dy > 0.015 * 0.015:
                 self._invalidate("ball_moved_before_pusher_contact")
             elif snap.pusher_ball_contact:
                 self.phase = DeliveryPhase.PUSHING
@@ -233,11 +245,18 @@ class DeliveryScorer:
             self._invalidate("double_tap_restrike")
 
         if self.phase == DeliveryPhase.RELEASED:
-            d_head = float(np.linalg.norm(ball_xy - self.head_pin_xy))
+            dx = ball_x - float(self.head_pin_xy[0])
+            dy = ball_y - float(self.head_pin_xy[1])
+            d_head = math.sqrt(dx * dx + dy * dy)
             self._min_ball_head_pin_dist = min(self._min_ball_head_pin_dist, d_head)
             self._left_reach |= ball_x - cfg.ball_radius > cfg.foul_line_x
-            ball_done = float(snap.ball_pos[2]) < cfg.off_table_z_m or float(np.linalg.norm(snap.ball_vel[:2])) < cfg.quiet_vel_mps
-            pins_done = bool(np.all((snap.pin_positions[:, 2] < cfg.off_table_z_m) | (snap.pin_speeds < cfg.quiet_vel_mps)))
+            vx, vy = float(snap.ball_vel[0]), float(snap.ball_vel[1])
+            quiet_vel_sq = cfg.quiet_vel_mps * cfg.quiet_vel_mps
+            ball_done = float(snap.ball_pos[2]) < cfg.off_table_z_m or vx * vx + vy * vy < quiet_vel_sq
+            pins_done = all(
+                z < cfg.off_table_z_m or speed < cfg.quiet_vel_mps
+                for z, speed in zip(snap.pin_positions[:, 2].tolist(), snap.pin_speeds.tolist())
+            )
             self._quiet_steps = self._quiet_steps + 1 if (ball_done and pins_done) else 0
 
     def _update_push(self, snap: SubstepSnapshot, ball_xy: np.ndarray, ball_x: float) -> None:
@@ -273,17 +292,17 @@ class DeliveryScorer:
         phi_next = self.compute_potential(paddle_pos)
         delta = np.asarray(action) - np.asarray(prev_action)
         reward = self.config.gamma * phi_next - self._phi_prev
+        self._ep_shaping_reward += float(reward)
         if self._contact_bonus_pending:
             if self.phase != DeliveryPhase.INVALID:
                 reward += self.config.r_first_contact
+                self._ep_contact_reward += float(self.config.r_first_contact)
             self._contact_bonus_pending = False
         self._phi_prev = phi_next
         self._terminated |= terminated
-        return float(
-            reward
-            - self.config.w_step_penalty
-            - self.config.w_action_jerk * np.sum(delta**2)
-        )
+        jerk_cost = self.config.w_action_jerk * np.sum(delta**2)
+        self._ep_cost_reward += float(-self.config.w_step_penalty - jerk_cost)
+        return float(reward - self.config.w_step_penalty - jerk_cost)
 
     def should_end_delivery(self, elapsed_delivery_s: float, delivery_timeout_s: float) -> tuple[bool, str | None]:
         if self.phase == DeliveryPhase.INVALID:
@@ -365,6 +384,9 @@ class DeliveryScorer:
             partial_pin_reward=partial_pin_reward,
             min_ball_head_pin_dist=float(self._min_ball_head_pin_dist),
             touched_ball=self._contact_bonus_awarded,
+            shaping_reward=float(self._ep_shaping_reward),
+            contact_reward=float(self._ep_contact_reward),
+            cost_reward=float(self._ep_cost_reward),
         )
 
     def critic_state(self, remaining_time_frac: float) -> np.ndarray:
